@@ -173,7 +173,10 @@ work can batch across ready requests. See the
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 
-Prompt reuse is enabled by default. `cache_prompt: false` on
+Prompt reuse is enabled by default; the mechanism behind the behaviour
+specified here, including what the cache retains and why it cannot resume from
+an arbitrary token, is described in
+[the continuation cache](CONTINUATION-CACHE.md). `cache_prompt: false` on
 `/v1/chat/completions` or `/v1/responses` bypasses memory and disk lookup for
 that request; the result can still populate the cache. DeepSeek and Qwen tool
 requests retain a checkpoint before the assistant-generation suffix, including

@@ -744,9 +744,10 @@ HttpResponse ListModels(TextGenerationBackend* backend,
           static_cast<std::size_t>(backend->max_context());
     json::Value input_modalities = json::Value::array();
     input_modalities.push_back("text");
-    if (backend->supports_images())
+    if (backend->supports_images()) {
       input_modalities.push_back("image");
       input_modalities.push_back("video");
+    }
     json::Value architecture = json::Value::object();
     architecture["input_modalities"] = std::move(input_modalities);
     model["architecture"] = std::move(architecture);

@@ -40,6 +40,9 @@ struct RopeLayout {
 
 struct PreparedImage {
   core::Image pixels;  ///< resized RGB8; temporal repetition happens on GPU
+  /// Second temporal frame of a video pair, same size as `pixels`. Empty
+  /// for still images, whose single frame fills both temporal slots.
+  core::Image next;
   ImageGrid grid;
   std::array<std::uint8_t, 32> prefix_identity{};
 };
@@ -58,6 +61,30 @@ struct Prompt {
 };
 
 [[nodiscard]] core::Image ResizeImage(const core::Image& image);
+/// Antialiased bicubic resize to an exact, already-chosen size.
+[[nodiscard]] core::Image ResizeImageTo(const core::Image& image,
+                                        std::uint32_t width,
+                                        std::uint32_t height);
+
+/// Reference video sampling: frames at kVideoFps, at least kVideoMinFrames,
+/// one pixel budget shared by every sampled frame.
+inline constexpr double kVideoFps = 2.0;
+inline constexpr std::uint64_t kVideoMinFrames = 4;
+inline constexpr std::uint64_t kVideoMaxFrames = 768;
+inline constexpr std::uint64_t kVideoMinPixels = 4096;
+inline constexpr std::uint64_t kVideoMaxPixels = 25165824;
+inline constexpr std::uint32_t kTemporalPatchSize = 2;
+
+struct VideoPlan {
+  /// Sampled source frame indices, padded with the last to an even count.
+  std::vector<std::uint64_t> frames;
+  /// One timestamp per frame pair: the pair's mean source time.
+  std::vector<double> seconds;
+  std::uint32_t width{0};
+  std::uint32_t height{0};
+};
+[[nodiscard]] VideoPlan PlanVideo(std::uint64_t frame_count, double fps,
+                                  std::uint32_t width, std::uint32_t height);
 [[nodiscard]] Prompt Prepare(
     const tokenization::QwenTokenizer& tokenizer,
     std::span<const tokenization::ChatMessage> messages,

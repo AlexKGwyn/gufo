@@ -319,10 +319,13 @@ Image Orient(Image image, unsigned orientation) {
 constexpr std::string_view kBase64 =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-std::vector<std::uint8_t> DecodeBase64(std::string_view input) {
+std::vector<std::uint8_t> DecodeBase64(std::string_view input,
+                                       std::size_t max_bytes,
+                                       std::string_view noun) {
+  const std::string kind(noun);
   if (input.empty() || input.size() % 4 != 0 ||
-      input.size() > ((kMaxEncodedImageBytes + 2) / 3) * 4) {
-    throw std::invalid_argument("invalid or oversized base64 image");
+      input.size() > ((max_bytes + 2) / 3) * 4) {
+    throw std::invalid_argument("invalid or oversized base64 " + kind);
   }
   std::vector<std::uint8_t> output;
   output.reserve(input.size() / 4 * 3);
@@ -333,21 +336,21 @@ std::vector<std::uint8_t> DecodeBase64(std::string_view input) {
       const char c = input[i + j];
       if (c == '=') {
         if (j < 2 || i + 4 != input.size()) {
-          throw std::invalid_argument("invalid base64 image padding");
+          throw std::invalid_argument("invalid base64 " + kind + " padding");
         }
         ++padding;
         bits <<= 6;
       } else {
         const auto digit = kBase64.find(c);
         if (digit == std::string_view::npos || padding != 0) {
-          throw std::invalid_argument("invalid base64 image character");
+          throw std::invalid_argument("invalid base64 " + kind + " character");
         }
         bits = (bits << 6) | static_cast<std::uint32_t>(digit);
       }
     }
     if ((padding == 1 && (bits & 0xff) != 0) ||
         (padding == 2 && (bits & 0xffff) != 0)) {
-      throw std::invalid_argument("noncanonical base64 image");
+      throw std::invalid_argument("noncanonical base64 " + kind);
     }
     output.push_back(static_cast<std::uint8_t>(bits >> 16));
     if (padding < 2)
@@ -355,8 +358,8 @@ std::vector<std::uint8_t> DecodeBase64(std::string_view input) {
     if (padding == 0)
       output.push_back(static_cast<std::uint8_t>(bits));
   }
-  if (output.size() > kMaxEncodedImageBytes) {
-    throw std::invalid_argument("image exceeds encoded byte limit");
+  if (output.size() > max_bytes) {
+    throw std::invalid_argument(kind + " exceeds encoded byte limit");
   }
   return output;
 }
@@ -446,18 +449,39 @@ bool IsPublicImageAddress(std::span<const std::uint8_t> address) noexcept {
            (address[2] & 0xf0) == 0);
 }
 
-std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
-                                       ImageReadBudget& budget) {
+namespace {
+struct MediaKind {
+  std::string_view noun;
+  std::string_view formats;
+  std::size_t max_bytes;
+  bool (*accepts)(std::string_view media);
+};
+
+constexpr MediaKind kImageKind{
+    "image", "PNG, JPEG or WebP", kMaxEncodedImageBytes,
+    [](std::string_view media) {
+      return media == "image/png" || media == "image/jpeg" ||
+             media == "image/jpg" || media == "image/webp";
+    }};
+
+constexpr MediaKind kVideoKind{
+    "video", "a video/* type", kMaxEncodedVideoBytes,
+    [](std::string_view media) { return media.starts_with("video/"); }};
+
+std::vector<std::uint8_t> ReadMediaUrl(
+    std::string_view url, std::size_t& remaining_bytes,
+    std::chrono::steady_clock::time_point deadline, const MediaKind& kind) {
+  const std::string noun(kind.noun);
   const auto remaining_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
-          budget.deadline - std::chrono::steady_clock::now())
+          deadline - std::chrono::steady_clock::now())
           .count();
-  if (budget.remaining_bytes == 0 || remaining_ms <= 0)
-    throw std::invalid_argument("request image byte or time budget exceeded");
+  if (remaining_bytes == 0 || remaining_ms <= 0)
+    throw std::invalid_argument("request " + noun + " byte or time budget exceeded");
   if (url.starts_with("data:")) {
     const auto comma = url.find(',');
     if (comma == std::string_view::npos || comma > 256)
-      throw std::invalid_argument("image data URL has no data");
+      throw std::invalid_argument(noun + " data URL has no data");
     // A media type, parameters and ";base64", case-insensitive (RFC 2397).
     // Clients differ in case, "image/jpg" and parameters such as a file
     // name; the decoder tells the formats apart by their bytes anyway.
@@ -466,37 +490,37 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
       return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
     });
     if (!header.ends_with(";base64"))
-      throw std::invalid_argument("image data URL must be base64-encoded");
+      throw std::invalid_argument(noun + " data URL must be base64-encoded");
     const std::string media = header.substr(0, header.find(';'));
-    if (media != "image/png" && media != "image/jpeg" && media != "image/jpg" &&
-        media != "image/webp")
-      throw std::invalid_argument("image data URL type \"" + media +
-                                  "\" is not supported; use PNG, JPEG or WebP");
+    if (!kind.accepts(media))
+      throw std::invalid_argument(noun + " data URL type \"" + media +
+                                  "\" is not supported; use " +
+                                  std::string(kind.formats));
     const auto encoded = url.substr(comma + 1);
     // Check the decoded size before allocating, including base64 padding.
     const auto padding = encoded.ends_with("==")  ? 2U
                          : encoded.ends_with("=") ? 1U
                                                   : 0U;
     if (encoded.size() / 4 * 3 < padding ||
-        encoded.size() / 4 * 3 - padding > budget.remaining_bytes)
-      throw std::invalid_argument("request image byte budget exceeded");
-    auto bytes = DecodeBase64(encoded);
-    budget.remaining_bytes -= bytes.size();
+        encoded.size() / 4 * 3 - padding > remaining_bytes)
+      throw std::invalid_argument("request " + noun + " byte budget exceeded");
+    auto bytes = DecodeBase64(encoded, kind.max_bytes, kind.noun);
+    remaining_bytes -= bytes.size();
     return bytes;
   }
   if (!url.starts_with("https://") || url.size() > 8192) {
     throw std::invalid_argument(
-        "image URL must use HTTPS or a base64 data URL");
+        noun + " URL must use HTTPS or a base64 data URL");
   }
   const std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(
       curl_easy_init(), curl_easy_cleanup);
   if (!curl)
-    throw std::runtime_error("cannot initialize image download");
+    throw std::runtime_error("cannot initialize " + noun + " download");
   std::vector<std::uint8_t> bytes;
   const std::string address(url);
   const auto set = [&](CURLoption option, auto value) {
     if (curl_easy_setopt(curl.get(), option, value) != CURLE_OK)
-      throw std::runtime_error("cannot configure image download");
+      throw std::runtime_error("cannot configure " + noun + " download");
   };
   set(CURLOPT_URL, address.c_str());
   set(CURLOPT_PROTOCOLS_STR, "https");
@@ -512,7 +536,7 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
   set(CURLOPT_NOSIGNAL, 1L);
   set(CURLOPT_FAILONERROR, 1L);
   set(CURLOPT_MAXFILESIZE_LARGE,
-      static_cast<curl_off_t>(budget.remaining_bytes));
+      static_cast<curl_off_t>(remaining_bytes));
   set(
       CURLOPT_OPENSOCKETFUNCTION,
       +[](void*, curlsocktype purpose,
@@ -540,8 +564,8 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
       });
   struct Download {
     std::vector<std::uint8_t>& bytes;
-    ImageReadBudget& budget;
-  } download{bytes, budget};
+    std::size_t& remaining_bytes;
+  } download{bytes, remaining_bytes};
   set(CURLOPT_WRITEDATA, &download);
   set(
       CURLOPT_WRITEFUNCTION,
@@ -549,11 +573,11 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
           void* opaque) -> std::size_t {
         auto& state = *static_cast<Download*>(opaque);
         auto& output = state.bytes;
-        if (size != 0 && count > state.budget.remaining_bytes / size) {
+        if (size != 0 && count > state.remaining_bytes / size) {
           return 0;
         }
         const std::size_t length = size * count;
-        state.budget.remaining_bytes -= length;
+        state.remaining_bytes -= length;
         try {
           output.insert(output.end(), data, data + length);
         } catch (...) {
@@ -563,9 +587,22 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
       });
   if (curl_easy_perform(curl.get()) != CURLE_OK || bytes.empty()) {
     throw std::invalid_argument(
-        "cannot download image within size/time limits");
+        "cannot download " + noun + " within size/time limits");
   }
   return bytes;
+}
+}  // namespace
+
+std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  return ReadMediaUrl(url, budget.remaining_bytes, budget.deadline,
+                      kImageKind);
+}
+
+std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  return ReadMediaUrl(url, budget.remaining_video_bytes, budget.video_deadline,
+                      kVideoKind);
 }
 
 }  // namespace gufo::core

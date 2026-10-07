@@ -490,6 +490,7 @@ std::optional<std::string> QwenChatTemplate::Render(
   }
 
   std::size_t image_count = 0;
+  std::size_t video_count = 0;
   std::optional<std::size_t> mutable_reasoning;
   // Agent clients may end every request with a user message that the next
   // request replaces (per-turn runtime context) rather than keeps. A
@@ -550,12 +551,16 @@ std::optional<std::string> QwenChatTemplate::Render(
         AppendContent(image_content, &image_spans,
                       std::string_view(msg.content)
                           .substr(cursor, image.offset - cursor));
-        ++image_count;
+        // Vision preparation expands a video marker into timestamped
+        // frame-pair runs, as the reference processor does.
+        const auto count = image.video ? ++video_count : ++image_count;
         if (options.add_vision_id)
-          image_content.append("Picture " + std::to_string(image_count) + ": ");
+          image_content.append((image.video ? "Video " : "Picture ") +
+                               std::to_string(count) + ": ");
         image_content.append(kVisionStart);
         local_image_offsets.push_back(image_content.size());
-        image_content.append(kImagePad).append(kVisionEnd);
+        image_content.append(image.video ? kVideoPad : kImagePad)
+            .append(kVisionEnd);
         cursor = image.offset;
       }
       AppendContent(image_content, &image_spans,

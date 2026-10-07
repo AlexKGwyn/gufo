@@ -53,6 +53,12 @@ public:
   [[nodiscard]] std::shared_ptr<const Embedding> Encode(
       const core::Image& image, const Observer& observer = {},
       const CancellationCheck& is_cancelled = {});
+  /// One video temporal patch: `image` and `next` fill the two frame slots
+  /// of the patch embedding. An empty `next` repeats `image`.
+  [[nodiscard]] std::shared_ptr<const Embedding> Encode(
+      const core::Image& image, const core::Image& next,
+      const Observer& observer = {},
+      const CancellationCheck& is_cancelled = {});
 
 private:
   struct Impl;

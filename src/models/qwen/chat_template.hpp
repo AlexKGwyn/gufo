@@ -64,7 +64,10 @@ struct ChatMessage {
     /// input order; image-only messages use offset zero.
     std::size_t offset{0};
     std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+    /// Encoded video container rather than a still image.
+    bool video{false};
   };
+  /// Images and videos in content order.
   std::vector<ImagePart> images;
 
   struct ToolArgument {

@@ -1414,7 +1414,7 @@ void TestModelInputModalities() {
     const auto* modalities = architecture->find("input_modalities");
     assert(modalities != nullptr);
     assert(modalities->dump() ==
-           (images ? R"(["text","image"])" : R"(["text"])"));
+           (images ? R"(["text","image","video"])" : R"(["text"])"));
   }
 }
 

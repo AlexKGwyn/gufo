@@ -71,8 +71,10 @@ __device__ __forceinline__ float Round(float x) {
   return static_cast<float>(Bf16(x));
 }
 
-__global__ void Patchify(const std::uint8_t* pixels, Bf16* patches,
-                         unsigned width, unsigned grid_width, unsigned count) {
+/// `next` is the second temporal frame; still images pass `pixels` twice.
+__global__ void Patchify(const std::uint8_t* pixels, const std::uint8_t* next,
+                         Bf16* patches, unsigned width, unsigned grid_width,
+                         unsigned count) {
   const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count * kPatchDim)
     return;
@@ -82,12 +84,14 @@ __global__ void Patchify(const std::uint8_t* pixels, Bf16* patches,
   const unsigned y = (merge / (grid_width / 2)) * 2 + (patch % 4) / 2;
   const unsigned x = (merge % (grid_width / 2)) * 2 + patch % 2;
   const unsigned channel = element / (2 * 16 * 16);
+  const unsigned temporal = (element / (16 * 16)) % 2;
   const unsigned spatial = element % (16 * 16);
+  const std::uint8_t* frame = temporal == 0 ? pixels : next;
   const unsigned pixel =
       ((y * 16 + spatial / 16) * width + x * 16 + spatial % 16) * 3;
   // Match rescale_and_normalize: multiply by 1/255 then subtract/divide.
   patches[i] = Bf16(
-      (static_cast<float>(pixels[pixel + channel]) * (1.0F / 255.0F) - 0.5F) /
+      (static_cast<float>(frame[pixel + channel]) * (1.0F / 255.0F) - 0.5F) /
       0.5F);
 }
 
@@ -564,6 +568,12 @@ Encoder::Embedding::~Embedding() {
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const core::Image& image, const Observer& observer,
     const CancellationCheck& is_cancelled) {
+  return Encode(image, core::Image{}, observer, is_cancelled);
+}
+
+std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
+    const core::Image& image, const core::Image& next,
+    const Observer& observer, const CancellationCheck& is_cancelled) {
   const auto check_cancelled = [&] {
     if (is_cancelled && is_cancelled())
       throw std::runtime_error("vision encoding cancelled");
@@ -575,11 +585,16 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
       image.pixels.size() != std::size_t{image.width} * image.height * 3) {
     throw std::invalid_argument("vision encoder requires a resized RGB32 grid");
   }
+  const bool paired = !next.pixels.empty();
+  if (paired && (next.width != image.width || next.height != image.height ||
+                 next.pixels.size() != image.pixels.size())) {
+    throw std::invalid_argument("video frame pair dimensions differ");
+  }
   impl_->Upload();
   const auto stream = impl_->stream;
   const unsigned count = (image.width / 16) * (image.height / 16);
   const unsigned merged = count / 4;
-  Allocation pixels(image.pixels.size());
+  Allocation pixels(image.pixels.size() * (paired ? 2 : 1));
   Allocation hidden(std::size_t{count} * kHidden * sizeof(float));
   Allocation work(std::size_t{count} * std::max(kFfn, 3 * kHidden) *
                   sizeof(float));
@@ -596,9 +611,17 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
   Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
   Check(hipMemcpyAsync(pixels.data, image.pixels.data(), image.pixels.size(),
                        hipMemcpyHostToDevice, stream));
+  if (paired) {
+    Check(hipMemcpyAsync(pixels.As<std::uint8_t>() + image.pixels.size(),
+                         next.pixels.data(), next.pixels.size(),
+                         hipMemcpyHostToDevice, stream));
+  }
   Patchify<<<(count * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
-             stream>>>(pixels.As<std::uint8_t>(), normalized.As<Bf16>(),
-                       image.width, image.width / 16, count);
+             stream>>>(pixels.As<std::uint8_t>(),
+                       pixels.As<std::uint8_t>() +
+                           (paired ? image.pixels.size() : 0),
+                       normalized.As<Bf16>(), image.width, image.width / 16,
+                       count);
   impl_->Gemm("patch", normalized.As<Bf16>(), hidden.As<float>(), count,
               kHidden, kPatchDim);
   PatchPosition<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,

@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/video.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::models::qwen::vision {
@@ -204,6 +206,11 @@ core::Image ResizeImage(const core::Image& image) {
                 std::ceil(image.width * beta / kResizeFactor)) *
             kResizeFactor;
   }
+  return ResizeImageTo(image, width, height);
+}
+
+core::Image ResizeImageTo(const core::Image& image, std::uint32_t width,
+                          std::uint32_t height) {
   if (width == image.width && height == image.height)
     return image;
   const auto horizontal = Filters(image.width, width);
@@ -246,6 +253,63 @@ core::Image ResizeImage(const core::Image& image) {
   return resized;
 }
 
+VideoPlan PlanVideo(std::uint64_t frame_count, double fps,
+                    std::uint32_t width, std::uint32_t height) {
+  if (frame_count == 0 || !(fps > 0) || width < kResizeFactor ||
+      height < kResizeFactor ||
+      static_cast<double>(std::max(width, height)) / std::min(width, height) >
+          200) {
+    throw std::invalid_argument("invalid video dimensions or frame rate");
+  }
+  VideoPlan plan;
+  // Qwen3-VL sample_frames: int(total / fps * 2), clamped, linspace-rounded.
+  auto count = static_cast<std::uint64_t>(static_cast<double>(frame_count) /
+                                          fps * kVideoFps);
+  count = std::min({std::max(count, kVideoMinFrames), kVideoMaxFrames,
+                    frame_count});
+  plan.frames.reserve(count + 1);
+  for (std::uint64_t i = 0; i < count; ++i) {
+    const double position =
+        count == 1 ? 0.0
+                   : static_cast<double>(i) * static_cast<double>(frame_count - 1) /
+                         static_cast<double>(count - 1);
+    // np.round rounds half to even, as does nearbyint's default mode.
+    plan.frames.push_back(static_cast<std::uint64_t>(std::nearbyint(position)));
+  }
+  while (plan.frames.size() % kTemporalPatchSize != 0)
+    plan.frames.push_back(plan.frames.back());
+  for (std::size_t i = 0; i < plan.frames.size(); i += kTemporalPatchSize) {
+    plan.seconds.push_back(
+        (static_cast<double>(plan.frames[i]) + plan.frames[i + 1]) / 2 / fps);
+  }
+  // Video smart_resize: the budget covers every sampled frame.
+  const auto temporal =
+      (count + kTemporalPatchSize - 1) / kTemporalPatchSize * kTemporalPatchSize;
+  std::uint32_t h = RoundEven(static_cast<double>(height) / kResizeFactor) *
+                    kResizeFactor;
+  std::uint32_t w =
+      RoundEven(static_cast<double>(width) / kResizeFactor) * kResizeFactor;
+  const double source = static_cast<double>(count) * width * height;
+  if (temporal * h * w > kVideoMaxPixels) {
+    const double beta = std::sqrt(source / kVideoMaxPixels);
+    h = std::max(kResizeFactor,
+                 static_cast<std::uint32_t>(std::floor(height / beta / kResizeFactor)) *
+                     kResizeFactor);
+    w = std::max(kResizeFactor,
+                 static_cast<std::uint32_t>(std::floor(width / beta / kResizeFactor)) *
+                     kResizeFactor);
+  } else if (temporal * h * w < kVideoMinPixels) {
+    const double beta = std::sqrt(kVideoMinPixels / source);
+    h = static_cast<std::uint32_t>(std::ceil(height * beta / kResizeFactor)) *
+        kResizeFactor;
+    w = static_cast<std::uint32_t>(std::ceil(width * beta / kResizeFactor)) *
+        kResizeFactor;
+  }
+  plan.width = w;
+  plan.height = h;
+  return plan;
+}
+
 Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
                std::span<const tokenization::ChatMessage> messages,
                std::span<const tokenization::ChatTool> tools,
@@ -282,6 +346,78 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   identity.Update(
       {reinterpret_cast<const std::uint8_t*>(encoder_identity.data()),
        encoder_identity.size()});
+  const auto special = [&](std::string_view text) {
+    const auto token = tokenizer.FindSpecialToken(text);
+    if (!token)
+      throw std::invalid_argument("tokenizer lacks " + std::string(text));
+    return *token;
+  };
+  const auto reserve = [&](std::size_t count) {
+    if (count > max_context - prompt.tokens.size()) {
+      throw std::length_error(
+          "video tokens exceed the " + std::to_string(max_context) +
+          "-token context; increase --context or shorten the video");
+    }
+  };
+  const auto AppendVideo = [&](const std::vector<std::uint8_t>& bytes) {
+    const core::EncodedVideo video(bytes);
+    const auto& info = video.info();
+    const auto plan = PlanVideo(info.frame_count, info.fps, info.width,
+                                info.height);
+    const auto pairs = plan.seconds.size();
+    const auto per_pair = std::size_t{plan.height / kResizeFactor} *
+                          (plan.width / kResizeFactor);
+    // Bound context before decoding: timestamps are at most a few tokens.
+    reserve(pairs * (per_pair + 2));
+    std::vector<std::uint64_t> unique(plan.frames);
+    unique.erase(std::ranges::unique(unique).begin(), unique.end());
+    std::vector<core::Image> frames;
+    frames.reserve(unique.size());
+    video.Decode(unique, [&](core::Image frame) {
+      frames.push_back(ResizeImageTo(frame, plan.width, plan.height));
+    });
+    // A container may hold fewer frames than its packets suggest.
+    const auto frame_at = [&](std::uint64_t source) -> const core::Image& {
+      const auto position = static_cast<std::size_t>(
+          std::ranges::lower_bound(unique, source) - unique.begin());
+      return frames[std::min(position, frames.size() - 1)];
+    };
+    const auto start = special(tokenization::kVisionStart);
+    const auto end = special(tokenization::kVisionEnd);
+    const auto pad = special(tokenization::kVideoPad);
+    tokenization::TokenizerOptions text_options;
+    text_options.add_bos = false;
+    text_options.add_eos = false;
+    text_options.parse_special_tokens = false;
+    constexpr std::string_view tag = "qwen-video-pair-v1";
+    for (std::size_t pair = 0; pair < pairs; ++pair) {
+      std::array<char, 48> stamp{};
+      const int length = std::snprintf(stamp.data(), stamp.size(),
+                                       "<%.1f seconds>", plan.seconds[pair]);
+      const auto text = tokenizer.Encode(
+          std::string_view(stamp.data(), static_cast<std::size_t>(length)),
+          text_options);
+      reserve(text.size() + per_pair + 2);
+      prompt.tokens.insert(prompt.tokens.end(), text.begin(), text.end());
+      prompt.tokens.push_back(start);
+      const ImageGrid grid{static_cast<std::uint32_t>(prompt.tokens.size()),
+                           plan.height / kResizeFactor,
+                           plan.width / kResizeFactor};
+      const auto& first = frame_at(plan.frames[pair * kTemporalPatchSize]);
+      const auto& second = frame_at(plan.frames[pair * kTemporalPatchSize + 1]);
+      identity.Update(
+          {reinterpret_cast<const std::uint8_t*>(tag.data()), tag.size()});
+      HashU32(identity, grid.offset);
+      HashU32(identity, grid.height);
+      HashU32(identity, grid.width);
+      identity.Update(first.pixels);
+      identity.Update(second.pixels);
+      prompt.tokens.insert(prompt.tokens.end(), per_pair, pad);
+      prompt.tokens.push_back(end);
+      prompt.rope.images.push_back(grid);
+      prompt.images.push_back({first, second, grid, identity.Digest()});
+    }
+  };
   std::size_t cursor = 0;
   std::size_t index = 0;
   for (const auto& message : messages) {
@@ -292,6 +428,15 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       }
       if (index >= offsets.size())
         throw std::logic_error("image rendering lost a part");
+      if (image.video) {
+        // The marker's vision_start/end are replaced by one framed run per
+        // frame pair, each preceded by its "<t seconds>" text.
+        append(cursor, offsets[index] - tokenization::kVisionStart.size());
+        AppendVideo(*image.bytes);
+        cursor = offsets[index++] + tokenization::kVideoPad.size() +
+                 tokenization::kVisionEnd.size();
+        continue;
+      }
       append(cursor, offsets[index]);
       auto pixels = ResizeImage(core::DecodeImage(*image.bytes));
       const ImageGrid grid{static_cast<std::uint32_t>(prompt.tokens.size()),
@@ -307,7 +452,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       identity.Update(pixels.pixels);
       prompt.tokens.insert(prompt.tokens.end(), count, kImageToken);
       prompt.rope.images.push_back(grid);
-      prompt.images.push_back({std::move(pixels), grid, identity.Digest()});
+      prompt.images.push_back({std::move(pixels), {}, grid, identity.Digest()});
       cursor = offsets[index++] + tokenization::kImagePad.size();
     }
   }

@@ -14,6 +14,7 @@ namespace gufo::core {
 
 inline constexpr std::size_t kMaxEncodedImageBytes = 20 * 1024 * 1024;
 inline constexpr std::size_t kMaxImagePixels = 32 * 1024 * 1024;
+inline constexpr std::size_t kMaxEncodedVideoBytes = 512 * 1024 * 1024;
 
 struct Image {
   std::uint32_t width{0};
@@ -31,6 +32,10 @@ struct ImageReadBudget {
   std::size_t remaining_bytes{kMaxEncodedImageBytes};
   std::chrono::steady_clock::time_point deadline{
       std::chrono::steady_clock::now() + std::chrono::seconds(15)};
+  /// Videos are larger and draw on their own allowance.
+  std::size_t remaining_video_bytes{kMaxEncodedVideoBytes};
+  std::chrono::steady_clock::time_point video_deadline{
+      std::chrono::steady_clock::now() + std::chrono::seconds(120)};
 };
 
 /// Network-order IPv4/IPv6 address; excludes local and special-use ranges.
@@ -41,6 +46,9 @@ struct ImageReadBudget {
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
                                                      ImageReadBudget& budget);
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url);
+/// The same sources for video containers; any video/* data URL type.
+[[nodiscard]] std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,
+                                                     ImageReadBudget& budget);
 
 }  // namespace gufo::core
 #endif

@@ -298,8 +298,29 @@ bool ParseContent(const json::Value* content,
       }
       continue;
     }
+    if (type == "video_url") {
+      const auto* video = part.find("video_url");
+      const auto* url =
+          video != nullptr && video->is_object() ? video->find("url") : nullptr;
+      if (message->role != tokenization::ChatRole::kUser || url == nullptr ||
+          !url->is_string()) {
+        *error = "video_url requires a user message and a string URL";
+        return false;
+      }
+      try {
+        message->images.push_back(
+            {output->size(),
+             std::make_shared<const std::vector<std::uint8_t>>(
+                 core::ReadVideoUrl(url->get_str(), budget)),
+             true});
+      } catch (const std::exception& exception) {
+        *error = exception.what();
+        return false;
+      }
+      continue;
+    }
     if (type != "text" && type != "input_text") {
-      *error = "message content parts must use text or image_url";
+      *error = "message content parts must use text, image_url or video_url";
       return false;
     }
     const json::Value* text = part.find("text");

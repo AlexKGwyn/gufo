@@ -108,6 +108,7 @@ endif()
 
 add_library(gufo_core STATIC
   src/core/image.cpp
+  src/core/video.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp

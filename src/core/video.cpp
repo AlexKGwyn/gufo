@@ -165,6 +165,16 @@ bool ParseInteger(std::string_view text, T& output) {
       std::from_chars(text.data(), text.data() + text.size(), output);
   return error == std::errc{} && end == text.data() + text.size();
 }
+
+// FFmpeg's expression parser nests each "+" operand, so a flat sum of
+// hundreds of terms fails to parse; a balanced sum stays logarithmically deep.
+std::string SelectFrames(std::span<const std::uint64_t> indices) {
+  if (indices.size() == 1)
+    return "eq(n," + std::to_string(indices[0]) + ")";
+  const auto half = indices.size() / 2;
+  return "(" + SelectFrames(indices.first(half)) + "+" +
+         SelectFrames(indices.subspan(half)) + ")";
+}
 }  // namespace
 
 EncodedVideo::EncodedVideo(std::span<const std::uint8_t> bytes) {

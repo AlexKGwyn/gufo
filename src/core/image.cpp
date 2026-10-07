@@ -477,7 +477,8 @@ std::vector<std::uint8_t> ReadMediaUrl(
           deadline - std::chrono::steady_clock::now())
           .count();
   if (remaining_bytes == 0 || remaining_ms <= 0)
-    throw std::invalid_argument("request " + noun + " byte or time budget exceeded");
+    throw std::invalid_argument("request " + noun +
+                                " byte or time budget exceeded");
   if (url.starts_with("data:")) {
     const auto comma = url.find(',');
     if (comma == std::string_view::npos || comma > 256)
@@ -509,8 +510,8 @@ std::vector<std::uint8_t> ReadMediaUrl(
     return bytes;
   }
   if (!url.starts_with("https://") || url.size() > 8192) {
-    throw std::invalid_argument(
-        noun + " URL must use HTTPS or a base64 data URL");
+    throw std::invalid_argument(noun +
+                                " URL must use HTTPS or a base64 data URL");
   }
   const std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(
       curl_easy_init(), curl_easy_cleanup);
@@ -535,8 +536,7 @@ std::vector<std::uint8_t> ReadMediaUrl(
       std::min(5000L, static_cast<long>(remaining_ms)));
   set(CURLOPT_NOSIGNAL, 1L);
   set(CURLOPT_FAILONERROR, 1L);
-  set(CURLOPT_MAXFILESIZE_LARGE,
-      static_cast<curl_off_t>(remaining_bytes));
+  set(CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(remaining_bytes));
   set(
       CURLOPT_OPENSOCKETFUNCTION,
       +[](void*, curlsocktype purpose,
@@ -586,8 +586,8 @@ std::vector<std::uint8_t> ReadMediaUrl(
         return length;
       });
   if (curl_easy_perform(curl.get()) != CURLE_OK || bytes.empty()) {
-    throw std::invalid_argument(
-        "cannot download " + noun + " within size/time limits");
+    throw std::invalid_argument("cannot download " + noun +
+                                " within size/time limits");
   }
   return bytes;
 }
@@ -595,8 +595,7 @@ std::vector<std::uint8_t> ReadMediaUrl(
 
 std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
                                        ImageReadBudget& budget) {
-  return ReadMediaUrl(url, budget.remaining_bytes, budget.deadline,
-                      kImageKind);
+  return ReadMediaUrl(url, budget.remaining_bytes, budget.deadline, kImageKind);
 }
 
 std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,

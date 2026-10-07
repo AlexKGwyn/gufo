@@ -71,16 +71,16 @@ public:
       code = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
                                               "/dev/null", O_RDONLY, 0);
     if (code == 0)
-      code = posix_spawn_file_actions_adddup2(&actions, stream[1],
-                                              STDOUT_FILENO);
+      code =
+          posix_spawn_file_actions_adddup2(&actions, stream[1], STDOUT_FILENO);
     if (code == 0)
       code = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
                                               "/dev/null", O_WRONLY, 0);
     if (code == 0)
       code = posix_spawn_file_actions_adddup2(&actions, input, kChildInput);
     if (code == 0)
-      code = posix_spawnp(&pid_, program, &actions, nullptr, argv.data(),
-                          environ);
+      code =
+          posix_spawnp(&pid_, program, &actions, nullptr, argv.data(), environ);
     (void)posix_spawn_file_actions_destroy(&actions);
     CloseFd(stream[1]);
     if (code != 0) {
@@ -159,7 +159,7 @@ bool ParseRate(std::string_view text, double& output) {
   return std::isfinite(output) && output > 0;
 }
 
-template <typename T>
+template<typename T>
 bool ParseInteger(std::string_view text, T& output) {
   const auto [end, error] =
       std::from_chars(text.data(), text.data() + text.size(), output);
@@ -195,8 +195,8 @@ EncodedVideo::EncodedVideo(std::span<const std::uint8_t> bytes) {
                "-of", "default=noprint_wrappers=1", std::string(kChildPath)},
               descriptor_);
   std::string text(kProbeOutputLimit, '\0');
-  text.resize(probe.Read(
-      {reinterpret_cast<std::uint8_t*>(text.data()), text.size()}));
+  text.resize(
+      probe.Read({reinterpret_cast<std::uint8_t*>(text.data()), text.size()}));
   probe.Finish();
   double average_rate = 0;
   double base_rate = 0;
@@ -240,7 +240,9 @@ EncodedVideo::EncodedVideo(std::span<const std::uint8_t> bytes) {
   }
 }
 
-EncodedVideo::~EncodedVideo() { CloseFd(descriptor_); }
+EncodedVideo::~EncodedVideo() {
+  CloseFd(descriptor_);
+}
 
 std::size_t EncodedVideo::Decode(
     std::span<const std::uint64_t> indices,
@@ -257,10 +259,13 @@ std::size_t EncodedVideo::Decode(
   }
   select.push_back('\'');
   Child decoder(Program("GUFO_FFMPEG", GUFO_FFMPEG_EXECUTABLE),
-                {"ffmpeg", "-nostdin", "-v", "error", "-i",
-                 std::string(kChildPath), "-map", "0:V:0", "-an", "-sn", "-dn",
-                 "-vf", select, "-fps_mode", "passthrough", "-f", "rawvideo",
-                 "-pix_fmt", "rgb24", "pipe:1"},
+                {"ffmpeg", "-nostdin",  "-v",
+                 "error",  "-i",        std::string(kChildPath),
+                 "-map",   "0:V:0",     "-an",
+                 "-sn",    "-dn",       "-vf",
+                 select,   "-fps_mode", "passthrough",
+                 "-f",     "rawvideo",  "-pix_fmt",
+                 "rgb24",  "pipe:1"},
                 descriptor_);
   const std::size_t frame_bytes = std::size_t{info_.width} * info_.height * 3;
   std::size_t delivered = 0;

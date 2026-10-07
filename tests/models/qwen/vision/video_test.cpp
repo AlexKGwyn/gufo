@@ -1,3 +1,5 @@
+#include "src/core/video.hpp"
+
 #include <unistd.h>
 
 #include <cmath>
@@ -10,7 +12,6 @@
 #include <vector>
 
 #include "src/core/image.hpp"
-#include "src/core/video.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -24,7 +25,9 @@ void Expect(bool condition, std::string_view message) {
     throw std::runtime_error(std::string(message));
 }
 
-bool Near(double a, double b) { return std::abs(a - b) < 1e-9; }
+bool Near(double a, double b) {
+  return std::abs(a - b) < 1e-9;
+}
 
 // Expected values follow the Qwen3-VL video processor by hand:
 // int(2220 / 29.97 * 2) = 148 frames, linspace(0, 2219, 148).round(), and
@@ -78,10 +81,10 @@ void TestTemplateVideoMarker() {
   const auto rendered = tokenization::QwenChatTemplate::Render(
       messages, {}, options, nullptr, &offsets);
   Expect(rendered.has_value() && offsets.size() == 2, "two vision parts");
-  const std::string video_marker =
-      std::string("Video 1: ") + std::string(tokenization::kVisionStart) +
-      std::string(tokenization::kVideoPad) +
-      std::string(tokenization::kVisionEnd);
+  const std::string video_marker = std::string("Video 1: ") +
+                                   std::string(tokenization::kVisionStart) +
+                                   std::string(tokenization::kVideoPad) +
+                                   std::string(tokenization::kVisionEnd);
   Expect(rendered->find(video_marker) != std::string::npos,
          "video renders a numbered video placeholder");
   Expect(rendered->find("Picture 1: ") != std::string::npos,

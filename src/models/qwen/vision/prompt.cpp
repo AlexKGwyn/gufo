@@ -253,8 +253,8 @@ core::Image ResizeImageTo(const core::Image& image, std::uint32_t width,
   return resized;
 }
 
-VideoPlan PlanVideo(std::uint64_t frame_count, double fps,
-                    std::uint32_t width, std::uint32_t height) {
+VideoPlan PlanVideo(std::uint64_t frame_count, double fps, std::uint32_t width,
+                    std::uint32_t height) {
   if (frame_count == 0 || !(fps > 0) || width < kResizeFactor ||
       height < kResizeFactor ||
       static_cast<double>(std::max(width, height)) / std::min(width, height) >
@@ -265,14 +265,15 @@ VideoPlan PlanVideo(std::uint64_t frame_count, double fps,
   // Qwen3-VL sample_frames: int(total / fps * 2), clamped, linspace-rounded.
   auto count = static_cast<std::uint64_t>(static_cast<double>(frame_count) /
                                           fps * kVideoFps);
-  count = std::min({std::max(count, kVideoMinFrames), kVideoMaxFrames,
-                    frame_count});
+  count = std::min(
+      {std::max(count, kVideoMinFrames), kVideoMaxFrames, frame_count});
   plan.frames.reserve(count + 1);
   for (std::uint64_t i = 0; i < count; ++i) {
-    const double position =
-        count == 1 ? 0.0
-                   : static_cast<double>(i) * static_cast<double>(frame_count - 1) /
-                         static_cast<double>(count - 1);
+    const double position = count == 1
+                                ? 0.0
+                                : static_cast<double>(i) *
+                                      static_cast<double>(frame_count - 1) /
+                                      static_cast<double>(count - 1);
     // np.round rounds half to even, as does nearbyint's default mode.
     plan.frames.push_back(static_cast<std::uint64_t>(std::nearbyint(position)));
   }
@@ -283,21 +284,21 @@ VideoPlan PlanVideo(std::uint64_t frame_count, double fps,
         (static_cast<double>(plan.frames[i]) + plan.frames[i + 1]) / 2 / fps);
   }
   // Video smart_resize: the budget covers every sampled frame.
-  const auto temporal =
-      (count + kTemporalPatchSize - 1) / kTemporalPatchSize * kTemporalPatchSize;
-  std::uint32_t h = RoundEven(static_cast<double>(height) / kResizeFactor) *
-                    kResizeFactor;
+  const auto temporal = (count + kTemporalPatchSize - 1) / kTemporalPatchSize *
+                        kTemporalPatchSize;
+  std::uint32_t h =
+      RoundEven(static_cast<double>(height) / kResizeFactor) * kResizeFactor;
   std::uint32_t w =
       RoundEven(static_cast<double>(width) / kResizeFactor) * kResizeFactor;
   const double source = static_cast<double>(count) * width * height;
   if (temporal * h * w > kVideoMaxPixels) {
     const double beta = std::sqrt(source / kVideoMaxPixels);
-    h = std::max(kResizeFactor,
-                 static_cast<std::uint32_t>(std::floor(height / beta / kResizeFactor)) *
-                     kResizeFactor);
-    w = std::max(kResizeFactor,
-                 static_cast<std::uint32_t>(std::floor(width / beta / kResizeFactor)) *
-                     kResizeFactor);
+    h = std::max(kResizeFactor, static_cast<std::uint32_t>(
+                                    std::floor(height / beta / kResizeFactor)) *
+                                    kResizeFactor);
+    w = std::max(kResizeFactor, static_cast<std::uint32_t>(
+                                    std::floor(width / beta / kResizeFactor)) *
+                                    kResizeFactor);
   } else if (temporal * h * w < kVideoMinPixels) {
     const double beta = std::sqrt(kVideoMinPixels / source);
     h = static_cast<std::uint32_t>(std::ceil(height * beta / kResizeFactor)) *
@@ -362,11 +363,11 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   const auto AppendVideo = [&](const std::vector<std::uint8_t>& bytes) {
     const core::EncodedVideo video(bytes);
     const auto& info = video.info();
-    const auto plan = PlanVideo(info.frame_count, info.fps, info.width,
-                                info.height);
+    const auto plan =
+        PlanVideo(info.frame_count, info.fps, info.width, info.height);
     const auto pairs = plan.seconds.size();
-    const auto per_pair = std::size_t{plan.height / kResizeFactor} *
-                          (plan.width / kResizeFactor);
+    const auto per_pair =
+        std::size_t{plan.height / kResizeFactor} * (plan.width / kResizeFactor);
     // Bound context before decoding: timestamps are at most a few tokens.
     reserve(pairs * (per_pair + 2));
     std::vector<std::uint64_t> unique(plan.frames);

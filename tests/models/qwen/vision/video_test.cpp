@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -130,6 +131,16 @@ void TestDecodeSyntheticVideo() {
          "indices past the end are not delivered");
   Expect(frames[0].pixels != frames[1].pixels,
          "selected frames are distinct pictures");
+  // The maximum sampled frame count must still form a valid FFmpeg select.
+  std::vector<std::uint64_t> many(vision::kVideoMaxFrames);
+  for (std::size_t i = 0; i < many.size(); ++i)
+    many[i] = i % 10 == 0 ? i / 10 : 1000 + i;
+  std::ranges::sort(many);
+  many.erase(std::ranges::unique(many).begin(), many.end());
+  std::size_t delivered = 0;
+  Expect(video.Decode(many, [&](core::Image) { ++delivered; }) == 10 &&
+             delivered == 10,
+         "hundreds of selected indices decode the frames that exist");
   Expect(frames[2].width == 96 && frames[2].height == 64 &&
              frames[2].pixels.size() == 96 * 64 * 3,
          "frames are packed RGB8");

@@ -249,15 +249,11 @@ std::size_t EncodedVideo::Decode(
     const std::function<void(Image)>& frame) const {
   if (indices.empty())
     return 0;
-  std::string select = "select='";
-  for (std::size_t i = 0; i < indices.size(); ++i) {
-    if (i != 0 && indices[i] <= indices[i - 1])
+  for (std::size_t i = 1; i < indices.size(); ++i) {
+    if (indices[i] <= indices[i - 1])
       throw std::invalid_argument("video frame indices must ascend");
-    if (i != 0)
-      select.push_back('+');
-    select += "eq(n," + std::to_string(indices[i]) + ")";
   }
-  select.push_back('\'');
+  const std::string select = "select='" + SelectFrames(indices) + "'";
   Child decoder(Program("GUFO_FFMPEG", GUFO_FFMPEG_EXECUTABLE),
                 {"ffmpeg", "-nostdin",  "-v",
                  "error",  "-i",        std::string(kChildPath),

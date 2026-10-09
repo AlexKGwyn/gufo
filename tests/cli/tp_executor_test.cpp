@@ -163,6 +163,11 @@ private:
 class ToyRunner final : public TextModelRunner {
 public:
   explicit ToyRunner(ToyOptions options) : options_(options) {}
+  DeviceProbeStatus probe_status{DeviceProbeStatus::kUsable};
+  DeviceProbeStatus PollDevice() const override { return probe_status; }
+  bool DeviceUsable() const override {
+    return probe_status != DeviceProbeStatus::kLost;
+  }
 
   CallLog Log() const {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -876,6 +881,18 @@ gufo::sampling::SamplingConfig Sampled() {
 }  // namespace
 
 int main() {
+  {
+    auto toy = std::make_shared<ToyRunner>(ToyOptions{});
+    const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());
+    using Status = TextModelRunner::DeviceProbeStatus;
+    for (const auto status :
+         {Status::kUsable, Status::kPending, Status::kLost}) {
+      toy->probe_status = status;
+      Require(runner.PollDevice() == status &&
+                  runner.DeviceUsable() == (status != Status::kLost),
+              "TP scheduler observes the underlying GPU probe result");
+    }
+  }
   const std::vector<TextRunnerToken> prompt{5, 9, 13, 17, 21, 3, 8};
 
   for (const bool mtp : {false, true}) {

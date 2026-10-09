@@ -222,7 +222,7 @@ On both hosts, from one commit (record it and the binary hash):
 1. The format check on a fresh copy of the tree, and the CPU suite and TP2
    tests above with no skips.
 2. Two hosts, Q4 and Q8, AR and MTP, greedy: outputs repeat, AR and MTP agree,
-   and prompts longer than one prefill chunk work.
+   and a prompt of over 30K tokens works (several full prefill steps).
 3. Seeded sampling reproduces; streaming, stop sequences, a tool call and
    client disconnects during decode and prefill behave as on one host.
 4. A multi-turn cached chat restores its whole prompt on replay; cached token
@@ -239,3 +239,22 @@ On both hosts, from one commit (record it and the binary hash):
    with status 1; killing rank 0 makes rank 1 exit with status 1. SIGTERM
    stops either rank promptly.
 9. For speed, report the median of several warm requests.
+
+## Open
+
+1. **Target verification on the split head**: only greedy drafts score half
+   the vocabulary. Verification rows and the frontier row the host samples
+   from still use the full head on both ranks.
+2. **Short prompts over USB4**: a fresh 2K prompt prefills more slowly than on
+   one host (1,300 against 1,492 tok/s, Q4 AR). On September 29, apparently
+   still over the ConnectX link, the pair reached 1,541 tok/s there.
+3. **Q8 MTP with several users**: at C8 it trails AR (117.7 against
+   131.8 tok/s), and its rates vary by up to 17% between server starts.
+4. **Q4 perplexity drift**: TP2 Q4 now scores 2.1182 against 2.1093 on
+   September 27 on the same WikiText-2 windows; not attributed.
+5. **MTP oracle**: `--mtp-audit` fails its round 9 wide-attention check by a
+   relative RMS of about 1e-6, on builds before and after the Q8 expert route.
+6. **Seeded sampling after upstream merges**: one seeded case changed output
+   after a merge of upstream `main` in late September; not attributed.
+7. **Q8 against an official reference**: Gufo and llama.cpp differ by KL
+   about 0.09; which is closer to the original model is open.

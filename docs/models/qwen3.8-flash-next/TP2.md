@@ -94,8 +94,10 @@ measured a typical 65.3 µs per exchange for both 64 B and 16 KiB, and
 `ib_write_bw` 31.86 Gbit/s. With a rebuilt `thunderbolt` module that adds
 the helper, plus donnerkeule's kernel patch
 `0004-thunderbolt-nhi-clear-pending-before-unmask.patch`, it measured 8.5 µs
-(64 B), 28 µs (16 KiB) and 40.5 Gbit/s, and one greedy Q8 + MTP request
-decoded at 42.8 instead of 34.7 tok/s. Check `dmesg` for that line.
+(64 B), 28 µs (16 KiB) and 40.5 Gbit/s. One greedy Q8 + MTP request then
+decoded at 42.8 instead of 34.7 tok/s (median of three runs each, both with
+the MTP draft policy on its one-session costs; see gufo-org/gufo#258). Check
+`dmesg` for that line.
 
 Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
 sequences, tool calls, images (`--mmproj` on both ranks), cancellation,

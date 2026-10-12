@@ -85,6 +85,18 @@ Three things that broke a boot-time setup (Ubuntu 26.04, rdma-core 61.0):
   enough: wait for `ACTIVE` in `/sys/class/infiniband/<device>/ports/1/state`,
   and let the supervised ranks keep retrying.
 
+On a kernel that does not export `tb_ring_throttling()` (Ubuntu 26.04's
+7.0.0-38 does not), the driver logs "optional tb_ring_throttling() helper
+unavailable; using stock NHI interrupt throttling" and ignores
+`nhi_interrupt_throttle_ns`, so the rings keep the stock 128 µs interrupt
+throttling and decode is bound by the exchange latency. There, `ib_write_lat`
+measured a typical 65.3 µs per exchange for both 64 B and 16 KiB, and
+`ib_write_bw` 31.86 Gbit/s. With a rebuilt `thunderbolt` module that adds
+the helper, plus donnerkeule's kernel patch
+`0004-thunderbolt-nhi-clear-pending-before-unmask.patch`, it measured 8.5 µs
+(64 B), 28 µs (16 KiB) and 40.5 Gbit/s, and one greedy Q8 + MTP request
+decoded at 42.8 instead of 34.7 tok/s. Check `dmesg` for that line.
+
 Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
 sequences, tool calls, images (`--mmproj` on both ranks), cancellation,
 `--request-timeout-ms`, history reuse and the disk cache (`--cache-disk` on

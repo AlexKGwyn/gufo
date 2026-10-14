@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -23,6 +24,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -37,6 +39,8 @@
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/core/hip/committed_backing.hpp"
+#include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
@@ -44,6 +48,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #endif
@@ -108,6 +113,34 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
   return options;
+}
+
+std::optional<std::size_t> CountQwenPromptTokens(
+    const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    std::uint32_t max_context) {
+  const auto options = QwenChatOptions(request, max_context);
+  const auto tools =
+      request.tool_choice == ChatRequest::ToolChoice::kNone
+          ? std::span<const tokenization::ChatTool>{}
+          : std::span<const tokenization::ChatTool>{request.tools};
+  if (std::ranges::none_of(request.messages,
+                           [](const auto& m) { return !m.images.empty(); })) {
+    const auto tokens = tokenization::QwenChatTemplate::RenderAndTokenize(
+        tokenizer, request.messages, tools, options);
+    if (!tokens)
+      return std::nullopt;
+    return tokens->size();
+  }
+  // Reuse generation's CPU image preparation, including resize, token
+  // expansion and projector validation. Counting does not encode images on
+  // the GPU or admit the prompt to an execution context. Keep only the shared
+  // layout's signed position limit so oversized prompts can still be sized.
+  return models::qwen::vision::Prepare(
+             tokenizer, request.messages, tools, options,
+             encoder ? encoder->identity() : std::string_view{},
+             std::numeric_limits<std::int32_t>::max())
+      .tokens.size();
 }
 
 TextPreparedPrompt PrepareQwenPrompt(
@@ -1149,6 +1182,12 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_);
+  }
+
+  [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest& request) const override {
+    return CountQwenPromptTokens(request, model_->GetTokenizer(),
+                                 model_->VisionEncoder(), max_context_);
   }
 
   void SetPromptContext(
@@ -2465,19 +2504,27 @@ public:
   QwenFlashNextTextRunnerState(const std::shared_ptr<QwenFlashNextModel>& model,
                                std::uint32_t max_context, bool use_mtp) {
     std::string error;
-    session_ =
+    owned_session_ =
         model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
                                      : gufo::core::SessionMode::kAutoregressive,
                              max_context, &error);
-    if (session_ == nullptr) {
+    if (owned_session_ == nullptr) {
       throw std::runtime_error("Failed to create Qwen3.8-Flash-Next session: " +
                                error);
     }
+    session_ = owned_session_.get();
   }
+
+  QwenFlashNextTextRunnerState(QwenFlashNextSession& session,
+                               cache::Adapter& adapter, cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    session_->Reset();
+    if (adapter_)
+      (void)adapter_->Invalidate(*slot_);
+    else
+      session_->Reset();
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
@@ -2490,11 +2537,20 @@ public:
   }
 
   [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
+  [[nodiscard]] models::qwen38_flash_next::ContinuationAdapter& adapter()
+      const {
+    return dynamic_cast<models::qwen38_flash_next::ContinuationAdapter&>(
+        *adapter_);
+  }
+  [[nodiscard]] cache::Slot& slot() const { return *slot_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<QwenFlashNextSession> session_;
+  std::unique_ptr<QwenFlashNextSession> owned_session_;
+  QwenFlashNextSession* session_{};
+  cache::Adapter* adapter_{};
+  cache::Slot* slot_{};
   std::size_t position_{0};
 };
 
@@ -2579,7 +2635,206 @@ public:
         auto& identity = persistence_->compatibility_identity;
         identity.insert(identity.end(), rank.begin(), rank.end());
       }
+      component_identity_ = persistence_->compatibility_identity;
+    } else {
+      std::ostringstream identity;
+      identity << "schema=gufo-process-text-continuation-v1\n"
+               << "model_instance=" << model_.get() << '\n'
+               << "context_tokens=" << max_context_ << '\n'
+               << "mtp=" << use_mtp_ << '\n'
+               << "draft_max_tokens=" << max_draft_tokens_ << '\n'
+               << "draft_cost_concurrency=" << model_->DecodeConcurrency()
+               << '\n';
+      const auto canonical = identity.str();
+      component_identity_.assign(canonical.begin(), canonical.end());
     }
+  }
+
+  [[nodiscard]] bool UsesComponentCache() const override {
+    return !distributed_;
+  }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override {
+    struct Backing {
+      hip::TransferPool streams{64};
+      std::unique_ptr<hip::CommittedBackingPool> pool;
+      std::map<std::uint32_t, std::size_t> component_classes;
+    };
+    auto result = std::make_unique<ComponentCacheResources>();
+    auto adapter =
+        std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
+            model_,
+            use_mtp_ ? core::SessionMode::kSpeculative
+                     : core::SessionMode::kAutoregressive,
+            max_context_, component_identity_);
+    (void)ram;  // Backing sizing follows actual slot allocation below.
+    result->adapter = std::move(adapter);
+    auto backing = std::make_shared<Backing>();
+    result->transfer_batch_size = 16;
+    const auto rounded = [](std::size_t bytes) {
+      return (bytes + 4095) / 4096 * 4096;
+    };
+    for (const auto& d : result->adapter->Components()) {
+      const auto bytes = rounded(d.kind == cache::ComponentKind::kPrivateState
+                                     ? d.state_bytes
+                                     : d.row_bytes * d.rows_per_chunk);
+      backing->component_classes.emplace(d.id.value, bytes);
+    }
+    // The remainder belongs to index, histories, disk catalog and queue
+    // metadata. The pools charge their own per-block allocator headroom.
+    result->commit_backing = [backing, &ledger,
+                              adapter =
+                                  result->adapter.get()](std::size_t budget) {
+      const auto plan =
+          static_cast<models::qwen38_flash_next::ContinuationAdapter*>(adapter)
+              ->BackingPlan(budget);
+      if (plan.size() != 1)
+        throw std::invalid_argument("insufficient component backing budget");
+      const auto& allocation = plan.front();
+      // Pages commit as captures need them. A payload cannot span segments,
+      // so the edge of each one strands space a ~140 MB private state cannot
+      // use; equal segments of about 1 GiB, and at least two private states,
+      // keep that small. A step costs about 200 ms of page faults and pinning
+      // (more when the host must reclaim page cache), so it runs ahead on a
+      // background thread; only a capture that outruns it grows on its own
+      // thread. Growth stops early when the host would keep less than its
+      // reserve.
+      std::size_t largest = 0;
+      for (const auto& [id, bytes] : backing->component_classes)
+        largest = std::max(largest, bytes);
+      const auto block = allocation.block_bytes;
+      const auto target =
+          std::max<std::size_t>(std::size_t{1} << 30, 2 * largest) / block;
+      const auto parts =
+          std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
+      const auto segment = (allocation.blocks + parts - 1) / parts * block;
+      struct Limited {
+        std::mutex mutex;
+        std::chrono::steady_clock::time_point refused;
+        bool active{};
+      };
+      backing->pool = std::make_unique<hip::CommittedBackingPool>(
+          ledger,
+          hip::BackingPoolConfig{
+              allocation.blocks * allocation.block_bytes +
+                  allocation.metadata_bytes,
+              allocation.block_bytes, allocation.metadata_bytes, segment,
+              [limited = std::make_shared<Limited>()](std::size_t bytes) {
+                const std::lock_guard lock(limited->mutex);
+                const auto now = std::chrono::steady_clock::now();
+                // Pressure retries ask once per capture; recheck at most
+                // once a second while the host is short.
+                if (limited->active &&
+                    now - limited->refused < std::chrono::seconds(1))
+                  return false;
+                const auto ceiling = HostSnapshotCeilingBytes();
+                // Pinned host pages come out of the same device heap that
+                // session and scratch allocations draw on; keep its dispatch
+                // reserve so they do not fall back to managed memory.
+                std::size_t heap_free = 0, heap_total = 0;
+                const bool heap_fits =
+                    hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+                    hip::HeapFitsAboveReserve(heap_free, bytes);
+                if (ceiling >= bytes && heap_fits) {
+                  limited->active = false;
+                  return true;
+                }
+                if (!limited->active)
+                  Logger::Warn(
+                      "cache",
+                      "schema=component-cache-v1 "
+                      "event=backing_limited reason=" +
+                          std::string(heap_fits ? "host_reserve "
+                                                : "device_heap_reserve ") +
+                          "segment_bytes=" + std::to_string(bytes) +
+                          " host_headroom_bytes=" + std::to_string(ceiling) +
+                          " device_heap_free_bytes=" +
+                          std::to_string(heap_free));
+                limited->active = true;
+                limited->refused = now;
+                return false;
+              }});
+      // The first capture would otherwise commit the first segment on the
+      // request path (seconds while the host reclaims page cache).
+      backing->pool->GrowAhead();
+    };
+    result->owner = backing;
+    result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
+      return backing->streams.TryAcquire();
+    };
+    result->allocate = [backing](const cache::PayloadRequest& request) {
+      // Bound the logical capture, then assign whole shared backing pages.
+      const auto capacity =
+          backing->component_classes.at(request.component.value);
+      if (request.bytes > capacity)
+        throw std::logic_error("component capture exceeds its backing class");
+      const auto category =
+          request.category == cache::ResourceCategory::kBackingAssigned
+              ? cache::ResourceCategory::kBackingAssigned
+              : request.category;
+      const auto segments = backing->pool->PageCommitAllocations();
+      const auto started = std::chrono::steady_clock::now();
+      auto block = backing->pool->TryAcquire(category, request.bytes);
+      if (backing->pool->PageCommitAllocations() != segments)
+        Logger::Info(
+            "cache",
+            "schema=component-cache-v1 event=backing_grown committed_bytes=" +
+                std::to_string(backing->pool->CommittedBytes()) + " segments=" +
+                std::to_string(backing->pool->PageCommitAllocations()) +
+                " acquire_ms=" +
+                std::to_string(std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - started)
+                                   .count()));
+      if (!block)
+        throw cache::ResourceExhausted();
+      // Commit the next segment off the capturing thread, which otherwise
+      // stalls this and every peer request for the allocation (up to seconds
+      // while the host reclaims page cache).
+      backing->pool->GrowAhead();
+      auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
+      return ComponentCaptureBuffer{
+          owner->Bytes(),
+          [owner] {
+            owner->Convert();
+            return std::move(*owner).TakePayload();
+          },
+          backing->pool.get(),
+          [owner, request](cache::SlotLease& lease, auto source) {
+            return cache::Payload::Borrowed(std::move(*owner).Borrow(
+                lease, request.component, request.first, request.end,
+                request.bytes, source));
+          }};
+    };
+    result->staging = [](std::size_t bytes) {
+      void* data = nullptr;
+      const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+      if (status != hipSuccess)
+        throw std::runtime_error(hipGetErrorString(status));
+      auto owner = std::shared_ptr<void>(
+          data, [](void* value) { (void)hipHostFree(value); });
+      std::memset(data, 0, bytes);
+      return cache::StagingAllocation{
+          std::move(owner), {static_cast<std::uint8_t*>(data), bytes}};
+    };
+    result->copy_observed_rows = [](auto source, auto destination,
+                                    cache::Stream& stream) {
+      return dynamic_cast<hip::TransferStream&>(stream).Copy(
+          destination.data(), source.data(), destination.size(),
+          hip::CopyDirection::kDeviceToHost, destination.size());
+    };
+    return result;
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& flash =
+        dynamic_cast<models::qwen38_flash_next::ContinuationAdapter&>(adapter);
+    return std::make_unique<QwenFlashNextTextRunnerState>(
+        flash.GetSession(slot), adapter, slot);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireQwenFlashNextState(state).set_position(position);
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -2598,7 +2853,8 @@ public:
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
-                .in_pass_checkpoint = true,
+                .in_pass_checkpoint = !distributed_,
+                .partial_prefill_retention = true,
             },
         .persistence = persistence_,
     };
@@ -2674,6 +2930,12 @@ public:
                              model_->VisionEncoder(), max_context_);
   }
 
+  [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest& request) const override {
+    return CountQwenPromptTokens(request, model_->tokenizer(),
+                                 model_->VisionEncoder(), max_context_);
+  }
+
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
@@ -2707,8 +2969,12 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<QwenFlashNextTextRunnerState>(model_, max_context_,
-                                                          use_mtp_);
+    if (distributed_) {
+      return std::make_unique<QwenFlashNextTextRunnerState>(
+          model_, max_context_, use_mtp_);
+    }
+    throw std::logic_error(
+        "Flash-Next execution slots are owned by the component cache");
   }
 
   void PreparePrefixReuse(
@@ -2784,25 +3050,37 @@ public:
   [[nodiscard]] TextPrefillStep PrefillThrough(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget, std::size_t boundary,
-      std::unique_ptr<TextRunnerSnapshot>* checkpoint) const override {
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& capture)
+      const override {
     auto& qfn = RequireQwenFlashNextState(state);
-    if (offset != qfn.position())
-      throw std::logic_error("in-pass checkpoint offset does not match state");
+    if (!checkpoint || !capture || offset != qfn.position())
+      throw std::logic_error("invalid component in-pass checkpoint request");
     const auto consumed = std::min<std::size_t>(
         {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
-    std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> captured;
-    std::string error;
     double capture_ms = 0;
-    if (!qfn.session().SyncThrough(prefix, static_cast<std::uint32_t>(boundary),
-                                   &captured, &error, &capture_ms)) {
+    try {
+      qfn.adapter().PrefillThrough(
+          qfn.slot(), prefix, static_cast<std::uint32_t>(boundary), [&] {
+            const auto started = std::chrono::steady_clock::now();
+            try {
+              *checkpoint = capture();
+            } catch (...) {
+              // Optional retention may refuse; the complete live prefill is
+              // valid.
+              checkpoint->reset();
+            }
+            capture_ms += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+          });
+    } catch (...) {
       qfn.set_position(0);
-      throw std::runtime_error("in-pass checkpoint failed: " + error);
+      throw;
     }
     qfn.set_position(next_position);
-    *checkpoint = std::make_unique<QwenFlashNextTextRunnerSnapshot>(
-        model_, std::move(captured), boundary);
     return {.consumed_tokens = consumed,
             .decode_ready = next_position == prompt.size(),
             .checkpoint_ms = capture_ms};
@@ -3147,6 +3425,7 @@ private:
   std::uint32_t max_draft_tokens_;
   bool distributed_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 #endif
 
@@ -3666,15 +3945,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
-        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+    if (resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
         !FingerprintArtifact(
             "Qwen3.8-Flash-Next", *reader,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
-        speculative_config.backend == TextSpeculativeBackend::kMtp &&
+    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
             "Qwen3.8-Flash-Next MTP", speculative_config.draft_model_path,
@@ -4345,8 +4622,8 @@ InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
-    std::string_view client_id,
-    const std::vector<std::string>& stop_sequences) {
+    std::string_view client_id, const std::vector<std::string>& stop_sequences,
+    bool cache_prompt) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -4356,9 +4633,10 @@ InferenceBackend::Result InferenceBackend::complete(
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
-      sampling_config, is_cancelled, on_token, std::string(client_id), {}, true,
-      0, stop_sequences);
+      sampling_config, is_cancelled, on_token, std::string(client_id), {},
+      cache_prompt, 0, stop_sequences);
 #else
+  (void)cache_prompt;
   (void)client_id;
   (void)stop_sequences;
   (void)prompt;
@@ -4410,14 +4688,14 @@ InferenceBackend::start_complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress) {
+    bool return_progress, bool cache_prompt) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return TextGenerationBackend::start_complete(
         prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-        ignore_eos, client_id, stop_sequences, return_progress);
+        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   if (state->control != nullptr) {
@@ -4427,8 +4705,8 @@ InferenceBackend::start_complete(
         state, std::move(prompt_tokens), max_tokens, sampling_config,
         is_cancelled, stream_output,
         client_id.empty() ? "anonymous" : std::string(client_id),
-        stop_sequences, InitialOutputState::kContent, request_start, true, 0,
-        nullptr, return_progress, std::nullopt, !ignore_eos);
+        stop_sequences, InitialOutputState::kContent, request_start,
+        cache_prompt, 0, nullptr, return_progress, std::nullopt, !ignore_eos);
   }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt_tokens), max_tokens, sampling_config, is_cancelled,
@@ -4438,7 +4716,7 @@ InferenceBackend::start_complete(
           .deadline = std::nullopt,
           .request_start = request_start,
           .prompt_context = {},
-          .cache_prompt = true,
+          .cache_prompt = cache_prompt,
           .cache_prefix_tokens = 0,
           .stop_at_eos = !ignore_eos,
           .stop_sequences = stop_sequences,
@@ -4449,7 +4727,7 @@ InferenceBackend::start_complete(
 #else
   return TextGenerationBackend::start_complete(
       prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-      ignore_eos, client_id, stop_sequences, return_progress);
+      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
 #endif
 }
 
@@ -4550,6 +4828,26 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
 #else
   (void)text;
   return 0;
+#endif
+}
+
+std::optional<std::size_t> InferenceBackend::count_chat_tokens(
+    const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr) {
+    return std::nullopt;
+  }
+  // The same preparation as chat(): constrained tool or format requests add
+  // prompt text before the template is rendered.
+  auto sampling = sampling::SamplingConfig{};
+  auto constrained =
+      ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
+  const auto& effective_request = constrained ? *constrained : request;
+  return state->scheduler->runner().CountPromptTokens(effective_request);
+#else
+  (void)request;
+  return std::nullopt;
 #endif
 }
 

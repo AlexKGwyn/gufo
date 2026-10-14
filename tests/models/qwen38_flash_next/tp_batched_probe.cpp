@@ -39,9 +39,11 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -173,8 +175,9 @@ Options (the same on both ranks unless noted):
   --tp-bootstrap-host HOST  Rank 0's address; required on rank 1. Rank 0
                           listens on all interfaces.
   --tp-bootstrap-port N   RDMA bootstrap port (default 18515)
+  --tp-rdma-device NAME   RDMA device (required when several are present)
   --tp-device N           HIP device index (default 0)
-  --tp-gid-index N        RDMA GID index (default 0)
+  --tp-gid-index N        RDMA GID index (default: automatic)
   --model PATH            First GGUF shard, required; a model without an MTP
                           sidecar
   --context N             Context (default 4096)
@@ -456,6 +459,15 @@ struct MoeInputHashes {
     if (hipStreamSynchronize(stream) == hipSuccess &&
         hipMemcpy(host.data(), data, bytes, hipMemcpyDeviceToHost) ==
             hipSuccess) {
+      std::size_t nonfinite = 0;
+      for (std::size_t i = 0; i + sizeof(float) <= bytes; i += sizeof(float)) {
+        float value;
+        std::memcpy(&value, host.data() + i, sizeof(value));
+        nonfinite += !std::isfinite(value);
+      }
+      if (nonfinite)
+        Warn("MoE observation has " + std::to_string(nonfinite) +
+             " nonfinite values at ordinal " + std::to_string(hashes.size()));
       hash = 1469598103934665603ULL;
       for (const std::uint8_t byte : host) {
         hash ^= byte;
@@ -875,7 +887,7 @@ int main(int argc, char** argv) {
   std::uint32_t context = 4096;
   std::uint32_t width = kPromptOptions;
   std::uint32_t device = 0;
-  std::uint32_t gid = 0;
+  std::optional<std::uint32_t> gid;
   /// `--serial`: the baseline, advancing the members one at a time.
   bool serial = false;
   /// `--allreduce-bench N`: time N exchanges per payload with no model.
@@ -884,6 +896,7 @@ int main(int argc, char** argv) {
   bool moe_input_hashes = false;
   std::uint16_t bootstrap_port = 18515;
   std::string bootstrap_host;
+  std::string rdma_device;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -944,16 +957,24 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--tp-bootstrap-host") {
       bootstrap_host = next();
+    } else if (arg == "--tp-rdma-device") {
+      rdma_device = next();
+      if (rdma_device.empty()) {
+        Warn("--tp-rdma-device requires a device name");
+        return kInvalidArguments;
+      }
     } else if (arg == "--tp-device") {
       if (!ParseUint(next(), &device)) {
         Warn("--tp-device requires an unsigned integer");
         return kInvalidArguments;
       }
     } else if (arg == "--tp-gid-index") {
-      if (!ParseUint(next(), &gid)) {
+      std::uint32_t parsed = 0;
+      if (!ParseUint(next(), &parsed)) {
         Warn("--tp-gid-index requires an unsigned integer");
         return kInvalidArguments;
       }
+      gid = parsed;
     } else if (arg == "--serial") {
       serial = true;
     } else if (arg == "--width") {
@@ -1064,6 +1085,7 @@ int main(int argc, char** argv) {
       .bootstrap_host = *rank == 0 ? std::string() : bootstrap_host,
       .bootstrap_port = bootstrap_port,
       .device_index = device,
+      .rdma_device = rdma_device,
       .gid_index = gid,
   };
   auto communicator = q::rocm::CreateIbrverbsCommunicator(rdma, &error);

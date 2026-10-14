@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -477,7 +479,10 @@ tokenization::ChatRole RoleFrom(const std::string& r) {
 // Messages replays assistant reasoning as thinking blocks. Restore it as the
 // turn's thought so the prompt reproduces the generated tokens.
 bool ReadTextContent(const json::Value* content, std::string* out,
-                     std::string* thought = nullptr) {
+                     std::string* thought = nullptr,
+                     tokenization::ChatMessage* image_message = nullptr,
+                     core::ImageReadBudget* image_budget = nullptr,
+                     std::string* error = nullptr) {
   if (content == nullptr)
     return false;
   if (content->is_string()) {
@@ -490,6 +495,16 @@ bool ReadTextContent(const json::Value* content, std::string* out,
         if (thinking == nullptr || !thinking->is_string())
           return false;
         *thought += thinking->str();
+        continue;
+      }
+      // Messages images ride along with the text of a user turn; `out` is
+      // that message's content, so the image lands at its current end.
+      if (image_message != nullptr && part.is_object() &&
+          part.member_str("type") == "image") {
+        std::string ignored;
+        if (!ParseAnthropicImage(part, image_message, *image_budget,
+                                 error != nullptr ? error : &ignored))
+          return false;
         continue;
       }
       const auto* text = part.find("text");
@@ -508,9 +523,10 @@ bool ReadTextContent(const json::Value* content, std::string* out,
 
 bool ReadTextMessages(const json::Value* input,
                       std::vector<tokenization::ChatMessage>* messages,
-                      bool responses = false,
+                      bool images_supported, bool responses = false,
                       std::string* parse_error = nullptr) {
   core::ImageReadBudget image_budget;
+  image_budget.accepts_images = images_supported;
   if (input == nullptr || !input->is_array() || input->empty())
     return false;
   // Responses replays one assistant turn as several reasoning, message and
@@ -533,7 +549,7 @@ bool ReadTextMessages(const json::Value* input,
                                       part.member_str("type") == "tool_result");
                             })) {
       std::string error;
-      if (!ParseAnthropicToolMessage(item, messages, &error)) {
+      if (!ParseAnthropicToolMessage(item, messages, image_budget, &error)) {
         if (parse_error && !error.empty())
           *parse_error = std::move(error);
         return false;
@@ -541,7 +557,9 @@ bool ReadTextMessages(const json::Value* input,
       continue;
     }
     if (responses && (item.member_str("type") == "function_call" ||
-                      item.member_str("type") == "function_call_output")) {
+                      item.member_str("type") == "function_call_output" ||
+                      item.member_str("type") == "custom_tool_call" ||
+                      item.member_str("type") == "custom_tool_call_output")) {
       tokenization::ChatMessage message;
       std::string error;
       if (!ParseOpenAiResponseMessage(item, &message, image_budget, &error)) {
@@ -599,12 +617,21 @@ bool ReadTextMessages(const json::Value* input,
           *parse_error = std::move(error);
         return false;
       }
-    } else if (!ReadTextContent(
-                   item.find("content"), &message.content,
-                   message.role == tokenization::ChatRole::kAssistant
-                       ? &message.thought
-                       : nullptr))
-      return false;
+    } else {
+      std::string error;
+      if (!ReadTextContent(item.find("content"), &message.content,
+                           message.role == tokenization::ChatRole::kAssistant
+                               ? &message.thought
+                               : nullptr,
+                           message.role == tokenization::ChatRole::kUser
+                               ? &message
+                               : nullptr,
+                           &image_budget, &error)) {
+        if (parse_error && !error.empty())
+          *parse_error = std::move(error);
+        return false;
+      }
+    }
     if (responses &&
         (message.role == tokenization::ChatRole::kSystem ||
          message.role == tokenization::ChatRole::kDeveloper) &&
@@ -664,12 +691,17 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                  "invalid_request_error", "model_not_found");
   }
   for (const std::string field : {"stream", "echo", "store", "background"}) {
-    if (const auto* value = body.find(field);
-        value != nullptr &&
-        (!value->is_bool() ||
-         (value->as_bool() && !(allowances.stream && field == "stream")))) {
-      return InvalidCompatibilityRequest("'" + field + "' must be false");
+    const auto* value = body.find(field);
+    if (value == nullptr)
+      continue;
+    if (field == "stream" && allowances.stream) {
+      // As on Chat Completions, null leaves streaming off.
+      if (!value->is_null() && !value->is_bool())
+        return InvalidCompatibilityRequest("'stream' must be a boolean");
+      continue;
     }
+    if (!value->is_bool() || value->as_bool())
+      return InvalidCompatibilityRequest("'" + field + "' must be false");
   }
   for (const std::string field : {"n", "best_of"}) {
     if (const auto* value = body.find(field);
@@ -872,6 +904,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       return InvalidCompatibilityRequest("'return_progress' must be a boolean");
     return_progress = value->as_bool();
   }
+  bool cache_prompt = true;
+  if (const auto* value = body.find("cache_prompt");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
+    cache_prompt = value->as_bool();
+  }
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -889,7 +928,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
 
   auto generation = b.start_complete(
       prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
-      req.client_id, stop_sequences, return_progress);
+      req.client_id, stop_sequences, return_progress, cache_prompt);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
   const std::string model = b.model_id();
@@ -1088,7 +1127,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
       "items, function calls or function outputs";
   if (input != nullptr && input->is_string() && !input->str().empty()) {
     messages.push_back({tokenization::ChatRole::kUser, input->str(), "", ""});
-  } else if (!ReadTextMessages(input, &messages, true, &input_error)) {
+  } else if (!ReadTextMessages(input, &messages, b.supports_images(), true,
+                               &input_error)) {
     return InvalidCompatibilityRequest(input_error);
   }
 
@@ -1166,38 +1206,30 @@ std::optional<HttpResponse> ReadMessagesOutputConfig(
   return {};
 }
 
-HttpResponse AnthropicMessages(const HttpRequest& req,
-                               TextGenerationBackend& b) try {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  ChatRequest chat;
-  chat.reasoning = b.reasoning_defaults();
+// The request fields Messages and count_tokens share: sampling and reasoning
+// controls, tools, system text and the turns.
+std::optional<HttpResponse> ReadAnthropicChat(
+    const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
+    std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
+  chat->reasoning = b.reasoning_defaults();
   if (body.is_object()) {
-    if (auto error = ReadThinking(body, &chat.reasoning))
-      return std::move(*error);
-    if (auto error = ReadMessagesOutputConfig(body, &chat.reasoning))
-      return std::move(*error);
+    if (auto error = ReadThinking(body, &chat->reasoning))
+      return error;
+    if (auto error = ReadMessagesOutputConfig(body, &chat->reasoning))
+      return error;
   }
-  std::size_t max_tokens = 0;
-  sampling::SamplingConfig sampling_config;
   if (auto error =
-          ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
-                                   &sampling_config, chat.reasoning.enabled,
+          ReadCompatibilityOptions(body, b, "max_tokens", max_tokens,
+                                   sampling_config, chat->reasoning.enabled,
                                    {.stop_field = "stop_sequences",
                                     .stream = true,
                                     .thinking = true,
                                     .output_config = true,
                                     .tools = true})) {
-    return std::move(*error);
+    return error;
   }
-  if (auto error = ParseAnthropicToolControls(body, &chat))
-    return std::move(*error);
+  if (auto error = ParseAnthropicToolControls(body, chat))
+    return error;
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* system = body.find("system")) {
@@ -1209,22 +1241,74 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
         {tokenization::ChatRole::kSystem, std::move(text), "", ""});
   }
   std::string messages_error =
-      "'messages' must contain text, thinking, tool_use or tool_result "
-      "blocks; use /v1/chat/completions for images";
-  if (!ReadTextMessages(body.find("messages"), &messages, false,
-                        &messages_error)) {
+      "'messages' must contain text, image, thinking, tool_use or tool_result "
+      "blocks";
+  if (!ReadTextMessages(body.find("messages"), &messages, b.supports_images(),
+                        false, &messages_error)) {
     return InvalidCompatibilityRequest(messages_error);
   }
 
-  chat.messages = std::move(messages);
-  chat.client_id = req.client_id;
+  chat->messages = std::move(messages);
   if (const auto error = ParseStopSequences(body.find("stop_sequences"),
                                             StopSequenceFormat::kAnthropic,
-                                            &chat.stop_sequences))
+                                            &chat->stop_sequences))
     return InvalidCompatibilityRequest(*error);
+  return std::nullopt;
+}
+
+HttpResponse AnthropicMessages(const HttpRequest& req,
+                               TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadAnthropicChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
+  chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
       body.find("stream") != nullptr && body.find("stream")->as_bool());
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
+}
+
+// The prompt size a Messages request would have, without generating.
+HttpResponse AnthropicCountTokens(const HttpRequest& req,
+                                  TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadAnthropicChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
+  if (body.find("stream") != nullptr && body.find("stream")->as_bool())
+    return InvalidCompatibilityRequest("'stream' must be false");
+  const auto tokens = b.count_chat_tokens(chat);
+  if (!tokens)
+    return NotImplemented(req, b);
+  json::Value resp = json::Value::object();
+  resp["input_tokens"] = *tokens;
+  return Ok(resp);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1260,10 +1344,17 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
     return InvalidCompatibilityRequest(*error);
+  bool cache_prompt = true;
+  if (const auto* value = body.find("cache_prompt");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
+    cache_prompt = value->as_bool();
+  }
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences);
+                 req.client_id, stop_sequences, cache_prompt);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1441,7 +1532,73 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
           .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
 }
 
+// Numeric literals only, so the listener never depends on name resolution.
+// IPv4 is parsed strictly, without inet_aton shorthand such as `127.1`; IPv6
+// goes through getaddrinfo so link-local scopes (`fe80::1%eth0`) resolve.
+bool ParseListenAddress(const std::string& host, int port,
+                        sockaddr_storage* address, socklen_t* length) {
+  *address = {};
+  const auto network_port = htons(static_cast<std::uint16_t>(port));
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    ipv4->sin_port = network_port;
+    *length = sizeof(sockaddr_in);
+    return true;
+  }
+  addrinfo hints{};
+  hints.ai_family = AF_INET6;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_NUMERICHOST;
+  addrinfo* result = nullptr;
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0)
+    return false;
+  const bool parsed = result != nullptr && result->ai_family == AF_INET6 &&
+                      result->ai_addrlen <= sizeof(sockaddr_storage);
+  if (parsed) {
+    std::memcpy(address, result->ai_addr, result->ai_addrlen);
+    reinterpret_cast<sockaddr_in6*>(address)->sin6_port = network_port;
+    *length = static_cast<socklen_t>(result->ai_addrlen);
+  }
+  ::freeaddrinfo(result);
+  return parsed;
+}
+
+// Client IDs key per-client scheduling, so one client keeps one ID whichever
+// listener it reaches: an IPv4 peer of a dual-stack `::` listener arrives as
+// `::ffff:a.b.c.d` and is reported as `a.b.c.d`. Empty when unavailable.
+std::string PeerAddress(int client_fd) {
+  sockaddr_storage peer{};
+  socklen_t length = sizeof(peer);
+  if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &length) !=
+      0)
+    return {};
+  if (peer.ss_family == AF_INET6) {
+    const auto& ipv6 = reinterpret_cast<const sockaddr_in6&>(peer);
+    if (IN6_IS_ADDR_V4MAPPED(&ipv6.sin6_addr)) {
+      sockaddr_in ipv4{};
+      ipv4.sin_family = AF_INET;
+      ipv4.sin_port = ipv6.sin6_port;
+      std::memcpy(&ipv4.sin_addr, &ipv6.sin6_addr.s6_addr[12],
+                  sizeof(ipv4.sin_addr));
+      std::memcpy(&peer, &ipv4, sizeof(ipv4));
+      length = sizeof(ipv4);
+    }
+  }
+  char text[NI_MAXHOST]{};
+  if (::getnameinfo(reinterpret_cast<const sockaddr*>(&peer), length, text,
+                    sizeof(text), nullptr, 0, NI_NUMERICHOST) != 0)
+    return {};
+  return text;
+}
+
 }  // namespace
+
+bool IsListenAddress(const std::string& host) {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  return ParseListenAddress(host, 0, &address, &length);
+}
 
 // ---------------------------------------------------------------------------
 // HttpRequest
@@ -1524,7 +1681,7 @@ void HttpServer::register_routes() {
 
   // ---- Anthropic ----
   add("POST", "/v1/messages", AnthropicMessages);
-  add("POST", "/v1/messages/count_tokens", NotImplemented);
+  add("POST", "/v1/messages/count_tokens", AnthropicCountTokens);
 
   // ---- llama-server ----
   add("POST", "/v1/rerank", NotImplemented);
@@ -1551,19 +1708,19 @@ bool HttpServer::start(std::string* error) {
     }
     return false;
   }
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
+  sockaddr_storage addr{};
+  socklen_t addr_length = 0;
   if (port_ < 0 || port_ > 65535 ||
-      ::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+      !ParseListenAddress(host_, port_, &addr, &addr_length)) {
     if (error != nullptr) {
       *error =
-          "host must be an IPv4 address and port must be between 0 and 65535";
+          "host must be an IPv4 or IPv6 address and port must be between "
+          "0 and 65535";
     }
     return false;
   }
-  addr.sin_port = htons(static_cast<unsigned short>(port_));
   (void)::signal(SIGPIPE, SIG_IGN);
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  listen_fd_ = ::socket(addr.ss_family, SOCK_STREAM, 0);
   if (listen_fd_ < 0) {
     if (error != nullptr)
       *error = "socket() failed";
@@ -1571,9 +1728,20 @@ bool HttpServer::start(std::string* error) {
   }
   const int yes = 1;
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  // `::` serves IPv4 clients too. Set it explicitly: the kernel default
+  // follows net.ipv6.bindv6only, which differs between hosts.
+  const int no = 0;
+  if (addr.ss_family == AF_INET6 &&
+      ::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) !=
+          0) {
+    if (error != nullptr)
+      *error = "setsockopt(IPV6_V6ONLY) failed";
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    return false;
+  }
 
-  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-      0) {
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
@@ -1589,7 +1757,7 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   if (port_ == 0) {
-    sockaddr_in bound{};
+    sockaddr_storage bound{};
     socklen_t length = sizeof(bound);
     if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound),
                       &length) != 0) {
@@ -1600,7 +1768,9 @@ bool HttpServer::start(std::string* error) {
       listen_fd_ = -1;
       return false;
     }
-    port_ = ntohs(bound.sin_port);
+    port_ = ntohs(bound.ss_family == AF_INET6
+                      ? reinterpret_cast<sockaddr_in6&>(bound).sin6_port
+                      : reinterpret_cast<sockaddr_in&>(bound).sin_port);
   }
   return true;
 }
@@ -1619,7 +1789,9 @@ void HttpServer::run(bool handle_signals) {
                             "configure HTTP listener");
   Logger::Info(
       "server",
-      "event=listening address=http://" + host_ + ":" + std::to_string(port_) +
+      "event=listening address=http://" +
+          (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
+          ":" + std::to_string(port_) +
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
@@ -1850,13 +2022,8 @@ void HttpServer::handle_connection(int client_fd) {
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
   static std::atomic<std::uint64_t> next_request{0};
-  sockaddr_in peer{};
-  socklen_t peer_size = sizeof(peer);
-  char peer_address[INET_ADDRSTRLEN]{};
-  if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer),
-                    &peer_size) == 0 &&
-      ::inet_ntop(AF_INET, &peer.sin_addr, peer_address, sizeof(peer_address)))
-    req.client_id = peer_address;
+  if (auto peer = PeerAddress(client_fd); !peer.empty())
+    req.client_id = std::move(peer);
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
   // Set for routes `--trace` records; `traced_stream` collects the body bytes
   // a streaming reply delivered.
@@ -1924,7 +2091,15 @@ void HttpServer::handle_connection(int client_fd) {
           const std::string_view header_line(headers.data() + cursor,
                                              line_end - cursor);
           const std::size_t colon = header_line.find(':');
-          if (colon != std::string_view::npos && colon > 0) {
+          // RFC 9112 5.1: reject whitespace before the colon and obsolete
+          // line folding instead of storing a name no lookup would match.
+          const auto token = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 ||
+                   std::string_view("!#$%&'*+-.^_`|~").find(c) !=
+                       std::string_view::npos;
+          };
+          if (colon != std::string_view::npos && colon > 0 &&
+              std::ranges::all_of(header_line.substr(0, colon), token)) {
             std::string name(header_line.substr(0, colon));
             std::string_view raw_value = header_line.substr(colon + 1);
             while (!raw_value.empty() &&
@@ -2160,8 +2335,11 @@ void HttpServer::handle_connection(int client_fd) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
-    HttpResponse resp = Err(500, "Internal Server Error",
-                            *e.what() ? e.what() : "generation failed",
+    const char* message = *e.what() ? e.what() : "generation failed";
+    // Retain the cause in logs alongside the client's stable code.
+    Logger::Error("http", "request=" + req.request_id +
+                              " event=server_exception reason=" + message);
+    HttpResponse resp = Err(500, "Internal Server Error", message,
                             "internal_error", "server_exception");
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     Logger::LogRequest(req.request_id, req.method, req.path,

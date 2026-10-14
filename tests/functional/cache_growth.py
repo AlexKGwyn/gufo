@@ -21,8 +21,11 @@ def retry_copy_refused(server_log, start, end, prompt_tokens):
     with server_log.open("rb") as log:
         log.seek(start)
         window = log.read(end - start).decode(errors="replace")
-    return re.search(r"event=snapshot action=skipped reason=(?:byte|entry)_capacity "
-                     rf"bytes=\d+ tokens={prompt_tokens} ", window) is not None
+    legacy = re.search(r"event=snapshot action=skipped reason=(?:byte|entry)_capacity "
+                       rf"bytes=\d+ tokens={prompt_tokens} ", window)
+    component = re.search(r"schema=component-cache-v1 event=capture_refused "
+                          rf"reason=(?:byte|entry)_capacity tokens={prompt_tokens}(?:\s|$)", window)
+    return legacy is not None or component is not None
 
 
 def check_unchanged_retry(label, retry, prefilled, server_log, start, end):
@@ -32,7 +35,8 @@ def check_unchanged_retry(label, retry, prefilled, server_log, start, end):
     restores the stable boundary and prefills only the assistant opening."""
     if not prefilled:
         return
-    total = retry["usage"]["prompt_tokens"]
+    usage = retry["usage"]
+    total = usage.get("prompt_tokens", usage.get("input_tokens"))
     assert prefilled <= ASSISTANT_OPENING_TOKENS and \
         retry_copy_refused(server_log, start, end, total), retry
     print(f"NOTE {label}: retry copy refused under memory pressure; "
@@ -147,7 +151,7 @@ def messages_result(client, body):
         "blocks": blocks, "tools": [],
         "finish": {"end_turn": "stop", "max_tokens": "length"}.get(
             response["stop_reason"], response["stop_reason"]),
-        "usage": {"prompt_tokens": usage["input_tokens"],
+        "usage": {"prompt_tokens": usage["input_tokens"] + usage["cache_read_input_tokens"],
                   "cached_tokens": usage["cache_read_input_tokens"],
                   "completion_tokens": usage["output_tokens"],
                   "gufo": {"prefill_tokens": timings["prompt_n"]}},
@@ -234,8 +238,8 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
             cold = chat_result(client, dict(
                 model=model, messages=chat, temperature=0, seed=31,
                 max_completion_tokens=request["max_tokens"],
-                **({} if thinking else {"reasoning_effort": "none"}),
-                extra_body={"cache_prompt": False}))
+                extra_body={"cache_prompt": False,
+                            "thinking": {"type": "enabled" if thinking else "disabled"}}))
             record(f"cold_control_{turn}", cold)
             total = warm["usage"]["prompt_tokens"]
             assert work(cold) == (total, 0, total), (warm, cold)

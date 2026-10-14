@@ -19,6 +19,7 @@
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
+#include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -70,6 +71,8 @@ private:
   void Preserve(std::uint32_t position, std::uint32_t mtp_position,
                 std::uint32_t blocks, std::uint32_t mtp_blocks,
                 bool detach = true) const;
+  /// Materialize with the registry mutex already held.
+  void MaterializeLocked() const;
   std::shared_ptr<SnapshotRegistry> registry_;
   std::shared_ptr<const SnapshotLineage> lineage_;
   std::shared_ptr<void> storage_;
@@ -132,6 +135,7 @@ public:
 private:
   friend class Executor;
   friend struct PrefillCheckpoint;
+  friend class gufo::models::qwen38_flash_next::ContinuationAdapter;
   Session() = default;
 
   struct LinearState {
@@ -176,6 +180,7 @@ private:
   bool mtp_enabled_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
+  ContinuationHooks* continuation_hooks_{nullptr};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   float* ple_history_{nullptr};  ///< [PleConvHistory()][hc_dim]
@@ -413,7 +418,12 @@ public:
       const SnapshotState* deferred = nullptr) const;
 
   /// Rewinds the draft block's own context.
-  void MtpRewind(Session& session, std::uint32_t position) const noexcept {
+  void MtpRewind(Session& session, std::uint32_t position) const {
+    if (session.continuation_hooks_ && position < session.mtp_.position)
+      session.continuation_hooks_->BeforeWrite(
+          true, position, session.mtp_.position,
+          std::min(session.mtp_.blocks, position / config().compress_ratio),
+          session.mtp_.blocks);
     if (session.mtp_.position != position)
       session.mtp_.residual_valid = false;
     session.mtp_.position = position;
@@ -479,6 +489,12 @@ private:
   };
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                 Q8Input* q, std::string* error_msg) const;
+  /// Q8_1 rows of a small-batch input that its producer kernel already
+  /// wrote (byte-identical to Quantize's), or null.
+  const void* ReadyQ8(const float* x, std::uint32_t n_tokens,
+                      std::uint32_t k) const;
+  /// Forgets the producer-written Q8_1 rows (their sources are rewritten).
+  void DropReadyQ8() const;
   bool Dense(const DeviceTensor& w, const Q8Input& q, float* out,
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
@@ -510,9 +526,11 @@ private:
                std::uint32_t n_tokens, std::string* error_msg) const;
   /// `normed` says the previous Combine already produced m's grouped norm
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
+  /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
+  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads.
   bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
              float* inject, std::uint32_t n_tokens, std::string* error_msg,
-             bool half_only = false) const;
+             bool half_only = false, bool no_f32 = false) const;
   /// Share mixer projections across decode requests without selecting the
   /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -520,8 +538,11 @@ private:
                   std::string* error) const;
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
-  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
-  void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
+  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
+  /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
+  /// partials in s_.inject (inject_fused_).
+  void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+               const float* inject_w = nullptr) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -564,6 +585,9 @@ private:
   /// output to options_.moe_observer.
   bool AllReduce(float* data, std::size_t rows, std::string* error_msg,
                  bool observe = true) const;
+  /// Whether MoeExperts takes the routed F16 WMMA route, whose epilogue the
+  /// following combine absorbs (see Moe).
+  bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
                   std::uint32_t n_tokens, std::string* error_msg) const;
@@ -641,7 +665,14 @@ private:
     std::int32_t* tokens;
     void* x_half;   ///< activations narrowed to the weight's 16-bit type
     void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
-    void* x_q8t;    ///< tiled Q8 activations of a wide batch (W8A8 route)
+    /// Q8_1 rows of a decode batch written by the kernel that produces
+    /// them: xn by HcCombine, lo by SiluScale, mixed by the mix epilogue.
+    void* xn_q8_1;
+    void* lo_q8_1;
+    void* mixed_q8_1;
+    void* gdn_q8_1;  ///< by the GDN epilogue (ssm_out's input)
+    void* ctx_q8_1;  ///< by the attention output gate (attn_out's input)
+    void* x_q8t;     ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
@@ -651,6 +682,7 @@ private:
     float* mixed;
     float* inject;
     float* block_out;
+    float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
     // linear attention
     float* qkv;
     float* z;
@@ -789,11 +821,11 @@ private:
   std::uint32_t* counts_host_{nullptr};
   std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};   ///< down projection tiles
-  mutable std::uint32_t routed_64_tiles_{0};  ///< appended 64-token tiles
+  mutable std::uint32_t routed_n_tiles_{0};   ///< routed_tile_rows_ tiles
+  mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
+  mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
-  mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
@@ -803,6 +835,11 @@ private:
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
+  /// Set before an attention-side combine whose FFN combine fuses the MoE
+  /// epilogue: that combine may then leave its residual update to the next
+  /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.
+  mutable bool defer_residual_{false};
+  mutable bool res_deferred_{false};
   /// Set by GatedDense when s_.shexp_half holds the SwiGLU rows its F16
   /// down projection reads.
   mutable bool shexp_half_ready_{false};
@@ -820,7 +857,19 @@ private:
   mutable bool xn_half_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
+  /// Inject weights whose partials the last combine already wrote to
+  /// s_.inject, so the following HcMix skips its inject pass.
+  mutable const float* inject_fused_{nullptr};
   mutable unsigned q8_slot_{0};
+  /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
+  struct ReadyRows {
+    const float* src{nullptr};
+    const void* data{nullptr};
+    std::uint32_t n{0};
+    std::uint32_t k{0};
+  };
+  mutable ReadyRows xn_q8_ready_;
+  mutable ReadyRows mixed_q8_ready_;
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

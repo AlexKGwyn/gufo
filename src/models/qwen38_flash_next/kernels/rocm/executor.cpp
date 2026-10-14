@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -48,9 +49,9 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
          std::string* error_msg, std::size_t* allocated_bytes = nullptr) {
   void* p = nullptr;
   const std::size_t bytes = std::max<std::size_t>(1, count) * sizeof(T);
-  if (hipMalloc(&p, bytes) != hipSuccess) {
+  if (hip::AllocateDevice(&p, bytes) != hipSuccess) {
     AssignError(error_msg,
-                "hipMalloc of " + std::to_string(bytes) + " bytes failed");
+                "allocation of " + std::to_string(bytes) + " bytes failed");
     allocations.push_back(nullptr);
     return nullptr;
   }
@@ -94,6 +95,13 @@ bool MatrixRows(std::uint32_t rows) {
 }
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
+}
+
+/// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
+/// contiguous element order is the layout.
+bool UnpaddedQ8(std::uint32_t k) {
+  return k % 32 == 0 &&
+         qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
 }
 
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
@@ -170,6 +178,16 @@ void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
 
 namespace {
 constexpr std::uint64_t kSnapshotReuseBytes = 8ULL << 20;
+// Device memory kept free beyond the executor's own lazy scratch, for the
+// runtime and driver. Snapshot storage never grows into it.
+constexpr std::uint64_t kSnapshotDeviceSlackBytes = 512ULL << 20;
+
+/// Snapshot storage would leave too little device memory. Callers keep the
+/// checkpoint in its host payload instead; the request continues.
+class SnapshotDeviceExhausted : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 }  // namespace
 // Legacy hipFree synchronizes unrelated inference streams. Pool allocations
 // have stream-ordered release, so evicting a checkpoint cannot stall a peer.
@@ -183,7 +201,8 @@ public:
   // HIP calls, so a background refill would land in a peer's decode instead.
   static constexpr std::size_t kSpareBlocks = 2;
 
-  SnapshotAllocator() {
+  /// `reserve` is the device memory every commit leaves free.
+  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -230,6 +249,17 @@ public:
   [[nodiscard]] static std::uint64_t SpareBytes(std::uint64_t block) {
     return kSpareBlocks * block;
   }
+  /// Whether committing `bytes` keeps the reserve free. The snapshot budget
+  /// counts host payloads, but on an APU the device limit can be lower than
+  /// host RAM. ROCm 7.2's VM pool corrupts its heap when a page commit
+  /// fails, so storage is never requested beyond the device headroom.
+  [[nodiscard]] bool Fits(std::uint64_t bytes) const {
+    std::size_t free = 0;
+    std::size_t total = 0;
+    if (hipMemGetInfo(&free, &total) != hipSuccess)
+      return false;
+    return free >= bytes && free - bytes >= reserve_;
+  }
   /// A transfer on a stream of its own, reused across transfers: creating a
   /// stream can stall for milliseconds, and a shared stream would make a
   /// capture wait for a peer's bulk materialization.
@@ -259,6 +289,8 @@ private:
                                hipGetErrorString(error));
   }
   void* Commit(std::uint64_t bytes) {
+    if (!Fits(bytes))
+      throw SnapshotDeviceExhausted("snapshot storage exceeds device headroom");
     void* data = nullptr;
     CheckStatus(hipMallocFromPoolAsync(&data, bytes, pool_, stream_),
                 "snapshot allocate");
@@ -288,6 +320,7 @@ private:
     // including when their source session has already been destroyed.
     (void)hipStreamSynchronize(stream_);
   }
+  std::uint64_t reserve_;
   std::mutex mutex_;
   std::vector<void*> spares_;
   std::uint64_t spare_bytes_{0};
@@ -299,7 +332,9 @@ private:
 
 std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
-    snapshot_allocator_ = std::make_shared<SnapshotAllocator>();
+    // Admission reserved the lazy scratch; snapshots must not consume it.
+    snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
+        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
   });
   return snapshot_allocator_;
 }
@@ -395,6 +430,10 @@ void SnapshotState::Materialize() const {
   std::lock_guard lock(registry_->mutex);
   if (registry_->failure)
     std::rethrow_exception(registry_->failure);
+  MaterializeLocked();
+}
+
+void SnapshotState::MaterializeLocked() const {
   const auto transfer = registry_->allocator->Transfer();
   for (const auto& region : regions_) {
     PopulateSnapshotPrefix(region.host, region.bytes);
@@ -530,6 +569,8 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity += block->capacity - block->used;
   // Allocate before enqueuing any copy or changing a checkpoint. Allocation
   // failure then leaves the source and every retained checkpoint intact.
+  std::vector<std::uint64_t> commits;
+  std::uint64_t needed = 0;
   for (std::size_t first = 0; first < copies.size();) {
     auto last = first;
     std::uint64_t bytes = 0;
@@ -542,11 +583,36 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity -= reused;
     bytes -= reused;
     if (bytes != 0) {
-      auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
-      reserve.push_back(block);
-      available.push_back(std::move(block));
+      commits.push_back(bytes);
+      needed += bytes;
     }
     first = last;
+  }
+  bool device = needed == 0 || allocator->Fits(needed);
+  if (device) {
+    try {
+      for (const auto bytes : commits) {
+        auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
+        reserve.push_back(block);
+        available.push_back(std::move(block));
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      device = false;
+    }
+  }
+  if (!device) {
+    // No device room for the overwritten rows: move each affected checkpoint
+    // into its host payload, which the snapshot budget already charges. This
+    // also releases the device copies it held from earlier rewinds.
+    std::vector<bool> affected(snapshots.size());
+    for (const auto& copy : copies)
+      for (const auto owner : copy.owners)
+        affected[owner] = true;
+    for (std::size_t index = 0; index < snapshots.size(); ++index)
+      if (affected[index])
+        snapshots[index]->MaterializeLocked();
+    copies.clear();
+    available.clear();
   }
   std::size_t block_index = 0;
   std::unique_ptr<gufo::hip::SnapshotTransfer> transfer;
@@ -825,25 +891,26 @@ void Session::Reset() {
   mtp_.residual_valid = false;
   mtp_.blocks = 0;
   const Config& c = owner_->config();
+  const auto zero = [&](void* pointer, std::size_t bytes) {
+    const auto result = hipMemsetAsync(pointer, 0, bytes, owner_->stream());
+    // Adapter invalidation may report success only after every zero fill was
+    // submitted and completed. Keep legacy cleanup's error policy unchanged.
+    if (result != hipSuccess && continuation_hooks_)
+      throw std::runtime_error(hipGetErrorString(result));
+  };
   const MixerHeads& heads = owner_->trunk_heads();
   for (auto& l : linear_) {
     if (l.state != nullptr) {
-      (void)hipMemsetAsync(l.conv_state, 0,
-                           static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
-                               heads.SsmConvChannels() * sizeof(float),
-                           owner_->stream());
-      (void)hipMemsetAsync(l.state, 0,
-                           static_cast<std::size_t>(heads.ssm_v) *
-                               heads.ssm_dim * heads.ssm_dim * sizeof(float),
-                           owner_->stream());
+      zero(l.conv_state, static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                             heads.SsmConvChannels() * sizeof(float));
+      zero(l.state, static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
+                        heads.ssm_dim * sizeof(float));
     }
   }
   blocks_ = 0;
   if (ple_history_ != nullptr) {
-    (void)hipMemsetAsync(ple_history_, 0,
-                         static_cast<std::size_t>(c.PleConvHistory()) *
-                             c.HcDim() * sizeof(float),
-                         owner_->stream());
+    zero(ple_history_, static_cast<std::size_t>(c.PleConvHistory()) *
+                           c.HcDim() * sizeof(float));
   }
 }
 
@@ -951,6 +1018,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                            static_cast<int>(model.max_q8_cols())),
         error_msg);
   }
+  const auto q8_1 = [&](std::size_t k) {
+    return Alloc<std::uint8_t>(
+        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
+        error_msg);
+  };
+  s.xn_q8_1 = q8_1(hc_dim);
+  s.lo_q8_1 = q8_1(c.hc_low_rank);
+  s.mixed_q8_1 = q8_1(hidden);
+  s.gdn_q8_1 = q8_1(c.SsmValueDim());
+  s.ctx_q8_1 = q8_1(c.AttentionQDim());
   s.x_q8t =
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
@@ -961,6 +1038,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.mixed = f32(T * hidden);
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
+  s.hc_defer_w = f32(T * c.hc_count);
   const std::uint32_t max_blocks =
       (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
   e->mask_words_ = (max_blocks + 31) / 32;
@@ -1277,7 +1355,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
         GdnRollbackRowFloats(row, heads.ssm_k, heads.ssm_v, heads.ssm_dim);
     const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
     float* allocation = nullptr;
-    if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
+    if (!Check(hip::AllocateDevice(&allocation, bytes), "rollback allocation",
+               error_msg))
       return false;
     session.rollback_allocations_.push_back(allocation);
     session.rollback_bytes_ += bytes;
@@ -1347,7 +1426,6 @@ std::size_t Executor::DeferredScratchBytes() const {
                                 c.vocab_size * sizeof(float)
                           : 0;
   const auto linear = c.num_layers - c.num_layers / c.full_attention_interval;
-  const MixerHeads& heads = trunk_heads();
   const auto conv =
       std::size_t{c.ssm_conv_kernel - 1} * heads.SsmConvChannels();
   const auto state = std::size_t{heads.ssm_v} * heads.ssm_dim * heads.ssm_dim;
@@ -1378,6 +1456,21 @@ int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
   return 80;
 }
 
+const void* Executor::ReadyQ8(const float* x, std::uint32_t n_tokens,
+                              std::uint32_t k) const {
+  for (const ReadyRows* r : {&xn_q8_ready_, &mixed_q8_ready_}) {
+    if (r->src != nullptr && r->src == x && r->n == n_tokens && r->k == k) {
+      return r->data;
+    }
+  }
+  return nullptr;
+}
+
+void Executor::DropReadyQ8() const {
+  xn_q8_ready_ = {};
+  mixed_q8_ready_ = {};
+}
+
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                         Q8Input* q, std::string* error_msg) const {
   q->x = x;
@@ -1386,6 +1479,10 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   q->k = k;
   if (MatrixRows(n_tokens)) {
     return true;  // the tiled path quantizes per call
+  }
+  if (const void* ready = ReadyQ8(x, n_tokens, k)) {
+    q->data = ready;
+    return true;
   }
   // Two slots alternate, so an input stays valid across one other
   // quantization; captured graphs replay the same alternation.
@@ -1715,11 +1812,19 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
        a.type == GgmlType::kQ8_0)) {
-    if (qfn_mmq_moe_gated_vec(
-            static_cast<int>(a.type), a.data, b.data, x, ids, out,
-            static_cast<int>(a.rows), static_cast<int>(a.cols),
-            static_cast<int>(n_tokens), static_cast<int>(a.experts),
-            static_cast<int>(n_used), stream_) != 0) {
+    // The shared expert quantized the same rows (or their producer did).
+    const void* ready = ReadyQ8(x, n_tokens, a.cols);
+    if ((ready != nullptr
+             ? qfn_mmq_moe_gated_vec_preq(
+                   static_cast<int>(a.type), a.data, b.data, ready, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)
+             : qfn_mmq_moe_gated_vec(
+                   static_cast<int>(a.type), a.data, b.data, x, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)) != 0) {
       AssignError(error_msg, "gated expert vector projection failed");
       return false;
     }
@@ -1755,35 +1860,84 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   return true;
 }
 
-void Executor::Combine(float* res, const float* gamma,
-                       std::uint32_t n_tokens) const {
+namespace {
+
+/// A mixer's F32 inject weights, which its combine can apply (see Combine).
+const float* InjectWeights(const DeviceMixer& m) {
+  return !m.inject.empty() && m.inject.type == GgmlType::kF32 ? m.inject.f32()
+                                                              : nullptr;
+}
+
+}  // namespace
+
+void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+                       const float* inject_w) const {
   const Config& c = config();
+  inject_fused_ = nullptr;
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
   xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
+  // The next mixer's inject pass reads only the F16 norm written here.
+  const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
+  const bool defer = defer_residual_;
+  defer_residual_ = false;
+  const bool deferred = res_deferred_;
+  res_deferred_ = false;
   if (moe_pending_) {
-    // The MoE epilogue was deferred to this combine (see Moe).
+    // The MoE epilogue was deferred to this combine (see Moe), and with it
+    // the previous combine's residual update when that was deferred too.
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
+    const float* fused_w = deferred ? fused_inject : nullptr;
     if (wide_mixer_ && MatrixRows(n_tokens) &&
-        HcCombineMoeF16(res, down, s_.weights, s_.shexp_out,
-                        s_.router + c.num_experts, c.num_experts + 1,
-                        c.num_experts_used, s_.inject, inject_parts_, gamma,
-                        s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                        c.hc_count, c.rms_eps, stream_)) {
+        HcCombineMoeF16(
+            res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
+            c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
+            gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+            c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
+            deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
+      inject_fused_ = fused_w;
       return;
+    }
+    if (deferred) {
+      HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
+                      stream_);
     }
     MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
                        s_.router + c.num_experts, c.num_experts + 1,
                        s_.block_out, n_tokens, c.num_experts_used,
                        c.hidden_size, stream_);
   }
+  if (deferred) {
+    // Only a fused MoE combine follows a deferring one; settle the update
+    // before anything else reads the residual.
+    HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
+                    stream_);
+  }
   if (xn_half_) {
-    HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
-                 s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                 stream_);
+    // The FFN combine that follows rereads this block output (42 MB at
+    // 4,096 tokens) instead of this combine writing the residual and the
+    // next reading it back (168 MB each).
+    const bool defer_now = defer && c.hc_count == 4;
+    res_deferred_ =
+        HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
+                     s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+                     c.rms_eps, stream_, defer_now ? s_.hc_defer_w : nullptr,
+                     s_.inject, defer_now ? fused_inject : nullptr);
+    if (res_deferred_)
+      inject_fused_ = fused_inject;
+    return;
+  }
+  // A decode batch's next mixer quantizes xn for its down projection: the
+  // combine writes those rows as well.
+  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+      HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                    s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
+                    stream_)) {
+    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
@@ -1792,13 +1946,16 @@ void Executor::Combine(float* res, const float* gamma,
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
-                     std::string* error_msg, bool half_only) const {
+                     std::string* error_msg, bool half_only,
+                     bool no_f32) const {
   const Config& c = config();
+  mixed_q8_ready_ = {};  // `mixed` is rewritten below
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
-  // wide route or as F32 in s_.xn.
+  // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
   if (!normed) {
     xn_half_ = false;
+    xn_q8_ready_ = {};
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
@@ -1827,14 +1984,32 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
-    SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-              static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-    if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
-      return false;
+    const float scale = 1.0F / static_cast<float>(c.hc_count);
+    const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
+        qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
+    if (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
+        m.up.cols == c.hc_low_rank &&
+        SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
+                      s_.lo_q8_1, stream_)) {
+      const Q8Input lo{s_.lo, s_.lo_q8_1, n_tokens, c.hc_low_rank};
+      if (!Dense(m.up, lo, s_.hc_gate, error_msg)) {
+        return false;
+      }
+    } else {
+      SiluScale(s_.lo, scale,
+                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+        return false;
+      }
     }
   }
   const bool fused_inject =
       inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
+  // The previous combine already wrote these partials from the same norm.
+  const bool inject_done = fused_inject && inject == s_.inject &&
+                           inject_fused_ != nullptr &&
+                           inject_fused_ == m.inject.f32();
+  inject_fused_ = nullptr;
   // A separate inject projection can overwrite the cached half input. Keep
   // the full mixed row available for the following projection in that case.
   half_only =
@@ -1851,8 +2026,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   if (xn_half_) {
     if (fused_projection) {
       if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
-                        s_.xn_half, fused_inject ? m.inject.f32() : nullptr,
-                        half_only ? nullptr : mixed,
+                        s_.xn_half,
+                        fused_inject && !inject_done ? m.inject.f32() : nullptr,
+                        half_only || no_f32 ? nullptr : mixed,
                         static_cast<__half*>(s_.x_half),
                         half_only ? nullptr : s_.x_q8t, inject, n_tokens,
                         c.hidden_size, c.hc_low_rank, stream_)) {
@@ -1882,8 +2058,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
                       stream_);
   } else {
+    // A decode batch's projections of `mixed` share its Q8_1 rows, which
+    // the epilogue writes as it stores them.
+    const bool q8 = !MatrixRows(n_tokens) && UnpaddedQ8(c.hidden_size);
     HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_);
+                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_,
+                  q8 ? s_.mixed_q8_1 : nullptr);
+    if (q8) {
+      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+    }
   }
   inject_parts_ = fused_inject ? (vectorized ? HcInjectPartsVec4(c.hidden_size)
                                              : HcInjectParts(c.hidden_size))
@@ -1892,6 +2075,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // A quantized inject projection (the draft block's) reads an F32 norm;
     // on the wide route the combine only produced F16, so norm again.
     if (xn_half_) {
+      xn_q8_ready_ = {};
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
@@ -2098,6 +2282,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // The existing F32 scratch has room for these slightly padded F16 rows.
   const std::uint32_t half_stride =
       half_output && n_tokens >= 1024 ? l.ssm_out.cols + 32 : 0;
+  // A decode batch's output projection reads the epilogue's Q8_1 rows.
+  const std::uint32_t value_dim = heads.SsmValueDim();
+  const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&
+                        c.ssm_head_dim == 128 &&
+                        l.ssm_out.type == GgmlType::kQ8_0 &&
+                        l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
@@ -2106,7 +2296,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
                 heads.ssm_k, heads.ssm_v, heads.ssm_dim, c.ssm_conv_kernel,
                 MatrixRows(n_tokens) && !speculative, convolved, c.rms_eps,
-                stream_, out_half, checkpoint, half_stride);
+                stream_, out_half, checkpoint, half_stride,
+                out_q8_1 ? s_.gdn_q8_1 : nullptr);
   if (!project_output) {
     return true;
   }
@@ -2126,6 +2317,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       return false;
     }
     return true;
+  }
+  if (out_q8_1) {
+    return Dense(l.ssm_out,
+                 Q8Input{s_.gdn_out, s_.gdn_q8_1, n_tokens, value_dim}, out,
+                 error_msg);
   }
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
@@ -2322,9 +2518,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, heads.attn, heads.attn_kv, heads.attn_dim,
                   c.compress_ratio, stream_);
-  SigmoidMul(s_.ctx, s_.attn_gate,
-             static_cast<std::size_t>(n_tokens) * heads.AttentionQDim(),
-             stream_);
+  const std::uint32_t q_dim = heads.AttentionQDim();
+  const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  // A decode batch's output projection reads the gate's Q8_1 rows.
+  if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
+      l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
+      SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
+    return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
+                 error_msg);
+  }
+  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
@@ -2528,6 +2731,18 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   return !reduce || AllReduce(out, n_tokens, error_msg);
 }
 
+bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
+  const Config& c = config();
+  return ExpertMatrixRows(n_tokens) &&
+         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ8_0) &&
+         l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+         (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+          l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+         c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+}
+
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                           std::uint32_t n_tokens,
                           std::string* error_msg) const {
@@ -2543,14 +2758,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // Tiled batches take the WMMA route: assignments compacted by expert
   // into 16-row padded buckets, token rows narrowed to F16 once, then the
   // F16 matrix-core GEMM per (expert, row tile).
-  const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
-                            (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ5_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ8_0) &&
-                            l.ffn_up_exps.type == l.ffn_gate_exps.type &&
-                            (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
-                            c.hidden_size % 256 == 0 && expert_ff % 64 == 0;
+  const bool wmma_experts = WmmaExperts(l, n_tokens);
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
                   s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
@@ -2593,18 +2801,23 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                              s_.rows_slot, s_.gate_e, nullptr, up_half,
                              expert_ff, c.hidden_size, stream_));
     if (!gated_ok) {
-      AssignError(error_msg, "routed F16 gate/up GEMM failed");
+      AssignError(
+          error_msg,
+          "routed F16 gate/up GEMM failed: tokens=" + std::to_string(n_tokens) +
+              " rows=" + std::to_string(expert_ff) +
+              " cols=" + std::to_string(c.hidden_size) +
+              " tiles=" + std::to_string(routed_n_tiles_) +
+              " pair_tiles=" + std::to_string(routed_pair_tiles_) +
+              " pair_rows=" + std::to_string(routed_pair_rows_) +
+              " tile_rows=" + std::to_string(routed_tile_rows_));
       return false;
     }
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Larger down tiles amortize weight decoding. Reuse the 64-token map
-    // when it has no more padded rows than the 48-token map.
-    const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
-        routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
-        routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
+    // Wide batches take the 64-token down tiles: they decode each expert's
+    // weights over more rows, also where 48-token tiles would be fewer.
+    const bool wide_down = routed_64_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
@@ -2801,6 +3014,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
+  DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   const bool prefill = mode == ForwardMode::kPrefill;
@@ -2861,6 +3075,13 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   } pinned_inputs{stream_};
   // Start the disk rows before protecting checkpoint rows, which can commit
   // device pages: layer 0 alone cannot hide the whole read.
+  if (session.continuation_hooks_) {
+    const auto end =
+        session.position_ + static_cast<std::uint32_t>(tokens.size());
+    session.continuation_hooks_->BeforeWrite(
+        false, session.position_, end, session.blocks_,
+        end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+  }
   const auto ngram = session.ngram_;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
@@ -3003,7 +3224,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         return false;
       const DeviceLayer& l = model_->layers()[il];
       if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative,
-                                   error_msg, false, checkpoint, 0)) {
+                                   error_msg, false, checkpoint)) {
         return false;
       }
       // Both stacked SSM projections consume the same F16 input. Avoid writing
@@ -3049,6 +3270,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                      ? nullptr
                      : model_->layers()[il + 1].hc_attn.norm.f32())
               : nullptr;
+      const float* next_inject =
+          next_norm != nullptr ? InjectWeights(model_->layers()[il + 1].hc_attn)
+                               : nullptr;
       // Cache updates precede the FFN. Without MTP, only requested head rows
       // and the checkpoint frontier consume the final layer's residual.
       // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
@@ -3059,12 +3283,20 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                ? (n - needed) / 128 * 128
                                : 0U;
       const auto finish = [&](std::uint32_t rows) {
-        Combine(s_.res, l.hc_ffn.norm.f32(), rows);
-        if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows,
-                   error_msg) ||
+        defer_residual_ = WmmaExperts(l, rows);
+        // The wide FFN reads the mix only through its F16 rows (router, routed
+        // experts) and tiled Q8 rows (shared expert).
+        const bool no_f32 = prefill_phase && defer_residual_ &&
+                            rows <= options_.max_batch &&
+                            l.router.type == GgmlType::kF16 &&
+                            l.shexp_gate.type == GgmlType::kQ8_0 &&
+                            l.shexp_up.type == GgmlType::kQ8_0;
+        Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
+        if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
+                   false, no_f32) ||
             !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
           return false;
-        Combine(s_.res, next_norm, rows);
+        Combine(s_.res, next_norm, rows, next_inject);
         return true;
       };
       if (skipped != 0) {
@@ -3518,7 +3750,7 @@ bool Executor::MoePart(std::uint32_t il, std::uint32_t n_tokens, bool reduce,
   const DeviceLayer& l = model_->layers()[il];
   // Each combine also norms the residual for the mixer that follows it,
   // unless PLE rewrites the residual first.
-  Combine(s_.res, l.hc_ffn.norm.f32(), n_tokens);
+  Combine(s_.res, l.hc_ffn.norm.f32(), n_tokens, InjectWeights(l.hc_ffn));
   return HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, n_tokens,
                error_msg) &&
          Moe(l, s_.mixed, s_.block_out, n_tokens, error_msg, false, reduce);
@@ -3531,7 +3763,9 @@ bool Executor::LayerBack(std::uint32_t il, std::uint32_t n_tokens) const {
           ? (c.IsPleLayer(il + 1) ? nullptr
                                   : model_->layers()[il + 1].hc_attn.norm.f32())
           : nullptr;  // the head norms the rows it reads itself
-  Combine(s_.res, next_norm, n_tokens);
+  Combine(
+      s_.res, next_norm, n_tokens,
+      next_norm ? InjectWeights(model_->layers()[il + 1].hc_attn) : nullptr);
   return next_norm != nullptr;
 }
 
@@ -3542,6 +3776,12 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (n == 0 || keep == 0 || keep > n) {
     AssignError(error_msg, "rollback outside the pending speculative batch");
     return false;
+  }
+  if (session.continuation_hooks_ && keep < n) {
+    const auto end = session.spec_base_ + keep;
+    session.continuation_hooks_->BeforeWrite(
+        false, end, session.position_,
+        std::min(session.blocks_, end / c.compress_ratio), session.blocks_);
   }
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
@@ -3878,18 +4118,23 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                        });
     pending->mutable_offset_ = sizeof(SnapshotHeader);
     pending->mutable_bytes_ = mutable_prefix - sizeof(SnapshotHeader);
-    pending->mutable_storage_ =
-        session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
-    pending->mutable_device_ =
-        static_cast<std::uint8_t*>(pending->mutable_storage_.get());
-    if (extra_bytes != 0) {
-      pending->extra_storage_ =
-          session.snapshots_->allocator->Allocate(extra_bytes);
-      pending->extra_bytes_ = extra_bytes;
+    try {
+      pending->mutable_storage_ =
+          session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
+      pending->mutable_device_ =
+          static_cast<std::uint8_t*>(pending->mutable_storage_.get());
+      if (extra_bytes != 0) {
+        pending->extra_storage_ =
+            session.snapshots_->allocator->Allocate(extra_bytes);
+        pending->extra_bytes_ = extra_bytes;
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      // No device room to freeze this capture: copy it to its host payload.
+      pending.reset();
     }
-  } else {
-    PopulateSnapshotPrefix(payload.data(), payload.size());
   }
+  if (!pending)
+    PopulateSnapshotPrefix(payload.data(), payload.size());
   std::memcpy(payload.data(), &h, sizeof(h));
   const auto grid_bytes =
       std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
@@ -4335,7 +4580,7 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       const auto capacity =
           std::max(penalties.size(), 2 * verification_penalty_capacity_);
       sampling::TokenPenalty* allocated = nullptr;
-      if (!Check(hipMalloc(&allocated, capacity * sizeof(*allocated)),
+      if (!Check(hip::AllocateDevice(&allocated, capacity * sizeof(*allocated)),
                  "verification penalty allocation", error_msg))
         return false;
       (void)hipFree(verification_penalties_);
@@ -4379,6 +4624,7 @@ bool Executor::MtpForward(Session& session,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
       std::any_of(tokens.begin(), tokens.end(), [&](auto t) {
@@ -4418,6 +4664,11 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(
+        true, pos, pos + n, session.mtp_.blocks,
+        pos + n > config().indexer_top_k ? (pos + n) / config().compress_ratio
+                                         : session.mtp_.blocks);
   session.PreserveSnapshots(session.position_, session.mtp_.position);
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;

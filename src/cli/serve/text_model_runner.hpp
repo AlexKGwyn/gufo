@@ -15,11 +15,15 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cache/adapter.hpp"
+#include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/core/sampling.hpp"
 
 namespace gufo::server {
+
+struct ComponentCacheResources;
 
 using TextRunnerToken = ContinuationToken;
 
@@ -111,6 +115,9 @@ struct TextRunnerCapabilities {
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
   bool in_pass_checkpoint{false};
+  /// A completed prefill step leaves a consistent state, so a cancelled
+  /// request can keep it as a live prefix for a superseding request.
+  bool partial_prefill_retention{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -283,6 +290,17 @@ public:
       return std::nullopt;
     return TextPreparedPrompt{std::move(*tokens), {}};
   }
+  /// Size a prompt without execution-context admission or inference. Image
+  /// runners override this to include their model's visual token expansion.
+  [[nodiscard]] virtual std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest& request) const {
+    // Use the text-only preparation here, including its capability check,
+    // without constructing a derived runner's cache metadata.
+    const auto prompt = TextModelRunner::PreparePrompt(request);
+    if (!prompt)
+      return std::nullopt;
+    return prompt->tokens.size();
+  }
   /// Called before cache restoration, prefill or selection, including
   /// a complete prefix hit. Must replace, never inherit, the previous request.
   virtual void SetPromptContext(
@@ -312,6 +330,13 @@ public:
 
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState()
       const = 0;
+
+  [[nodiscard]] virtual bool UsesComponentCache() const { return false; }
+  [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger&, std::size_t) const;
+  [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter&, cache::Slot&) const;
+  virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
 
   /// Optional first-token preview without advancing model state. The caller
   /// supplies a copy of the sampler; normal decoding must reproduce the token.
@@ -346,9 +371,13 @@ public:
       std::size_t, std::size_t) const {
     return std::nullopt;
   }
+  /// Component runners invoke the consumer synchronously while the coherent
+  /// boundary is readable. It must drain captures before execution resumes.
+  /// Native snapshot runners leave the consumer empty.
   [[nodiscard]] virtual TextPrefillStep PrefillThrough(
       TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
-      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*) const {
+      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*,
+      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& = {}) const {
     throw std::logic_error("runner does not support in-pass checkpoints");
   }
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
@@ -459,6 +488,7 @@ public:
   class Request {
   public:
     struct CommitMetrics {
+      std::optional<ComponentCacheMetrics> component_cache;
       std::size_t snapshot_bytes{0};
       double snapshot_ms{0.0};
       std::size_t disk_queued_bytes{0};
@@ -485,6 +515,8 @@ public:
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;
     [[nodiscard]] bool cache_disk_hit() const noexcept;
+    [[nodiscard]] std::optional<ComponentCacheMetrics> component_cache_metrics()
+        const;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
     [[nodiscard]] bool prefill_complete() const noexcept;
     [[nodiscard]] std::span<const TextRunnerToken> prompt() const noexcept;
@@ -575,6 +607,10 @@ public:
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const TextRunnerToken> prompt,
       const TextPromptContext* context) const;
+  /// A disk job is still writing a prefix of prompt much deeper than any
+  /// restorable checkpoint; admission may wait for it instead of prefilling.
+  [[nodiscard]] bool PublicationPending(std::span<const TextRunnerToken> prompt,
+                                        const TextPromptContext* context) const;
 
 private:
   struct Impl;

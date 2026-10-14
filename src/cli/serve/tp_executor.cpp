@@ -696,14 +696,6 @@ TpMirroredRunner::BuildConstraintVocabulary() const {
   return inner_->BuildConstraintVocabulary();
 }
 
-TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
-  return inner_->PollDevice();
-}
-
-bool TpMirroredRunner::DeviceUsable() const {
-  return inner_->DeviceUsable();
-}
-
 sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
   return inner_->ToolFormat();
 }

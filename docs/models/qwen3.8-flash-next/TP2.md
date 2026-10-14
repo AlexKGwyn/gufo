@@ -195,6 +195,30 @@ are reused at once, as on one host; a request that reuses what an unjudged
 request left fails too if rank 1 later rejects that request, and a rejected
 request's states and snapshots are not reused.
 
+## Upstream integration, October 14, 2026
+
+The cache-integration branch and upstream main through `942999e7` are merged
+with the RDMA head and expert partitions retained. Packed Q8 decode inputs,
+vectorized residual additions, padded SSM output rows, mapped PLE rows and
+fused HC inject work also serve TP2. SSM padding retains the rank's 3072-wide
+projection tile plan, and packed decode rows use its actual value-head width. Inject work runs after the rank reduction. Weight placement measures
+and uploads the same partition-aware traversal, including temporary gathers.
+
+Upstream's wave-owned paired gate/up kernel serves Q4_K and Q5_K. Q8_0 pairs
+keep their signed-byte staging and wave pairing; both 64- and 128-row tiles
+remain available. The routed oracle checks both widths, including ragged TP2
+output and input partitions, against unchanged numerical limits. Down
+projections address the separate 64-row map rather than the leading 48-row map.
+
+Single-host Flash-Next serving uses upstream's component cache. TP2 retains
+its coordinated rank snapshots and disk cache: component captures and their
+ownership transitions are not yet mirrored by the control protocol. In-pass
+checkpoints remain disabled in the TP wrapper. Deferred MoE residual fusion
+stays on the single-host path, where it cannot bypass a required rank sum.
+
+The experimental DMA-BUF transport and configurable CQ spin budget are saved
+separately on `codex/wip-tp2-transport-experiments`; neither is part of this merge.
+
 ## Tests and probes
 
 - `tp_control_test`, `tp_executor_test` (label `tp2`, in the CPU suite): the

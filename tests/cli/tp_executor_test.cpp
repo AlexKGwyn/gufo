@@ -883,7 +883,7 @@ std::vector<std::pair<std::string_view, std::size_t>> CapabilityFields(
                final_token_advance_required, incremental_text_is_exact,
                multi_token_decode, batched_multi_token_decode,
                batched_multi_token_decode_max_width, prefix_reuse,
-               in_pass_checkpoint] = capabilities;
+               in_pass_checkpoint, partial_prefill_retention] = capabilities;
   return {{"incremental_prefill", incremental_prefill},
           {"snapshot", snapshot},
           {"fork", fork},
@@ -894,7 +894,8 @@ std::vector<std::pair<std::string_view, std::size_t>> CapabilityFields(
           {"batched_multi_token_decode_max_width",
            batched_multi_token_decode_max_width},
           {"prefix_reuse", prefix_reuse},
-          {"in_pass_checkpoint", in_pass_checkpoint}};
+          {"in_pass_checkpoint", in_pass_checkpoint},
+          {"partial_prefill_retention", partial_prefill_retention}};
 }
 
 /// Capabilities TP2 turns off because rank 1 cannot mirror them yet. Each is
@@ -944,6 +945,7 @@ int main() {
         .batched_multi_token_decode_max_width = 8,
         .prefix_reuse = true,
         .in_pass_checkpoint = true,
+        .partial_prefill_retention = true,
     };
     auto toy = std::make_shared<ToyRunner>(ToyOptions{.capabilities = every});
     const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());

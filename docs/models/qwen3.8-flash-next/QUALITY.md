@@ -1,18 +1,50 @@
 # Qwen3.8 Flash-Next quality
 
-**Concurrency: 63 tg128 requests match fresh AR completions:**
-21 AR, 21 mixed MTP and 21 repetitive MTP at C1/2/4/6/8. Unsloth UD-Q4_K_XL target,
-shared Q8_0 MTP; [identities](artifacts/model-identities.json).
-These are consistency checks, not original unquantized-model or GGUF-conversion
-qualification. Concurrency checks: October 9, 2026; attention review:
-September 27–28.
+**PR #571's wave-owned prefill weights retain byte-exact logits:**
+99,328,000 F32 values after a 34,159-token code/prose prompt and 400 fixed
+continuation steps, batch 4096, capacity 65536, match the original PR control
+`f06f32b9`. October 13, 2026 (Europe/Paris), kernel snapshot `a772fae6` atop
+`33a91366`, with the same pinned toolchain. Independent FP64 routed checks,
+unsaturated activations, odd outputs and guarded partial tiles pass. Fused SSM
+convolution, output, state and replay remain exact, including 2049-token tails.
+Deferred residual, F16 norm, packed Q8 bytes and independent host FP32 inject
+checks pass unchanged. All 16 measured AR/MTP HTTP completions at d0/d32K
+retain exact outputs and token/cache/draft counts, with no per-request
+prefill/decode timing flag. The first unusually slow mixed-MTP control is
+excluded as effect-size evidence.
+These are regression checks. The older functional timing failures below remain
+unresolved, and upstream model/conversion accuracy is not requalified.
+
+**PR #518 retains main's full logits at 64K/128K:** 512 fixed code/prose token
+positions, each checked at verification widths 1–8; all 1,017,118,720 logit
+comparisons are byte-exact (KL/TV 0, top-1 agreement 100%). Prefill and 56
+partial rollback/replay checks are exact too. October 10, 2026, candidate
+`25cdb2a1` versus main `a41e88da`.
+Unsloth UD-Q4_K_XL target, shared Q8_0 MTP;
+[identities](artifacts/model-identities.json) · [review evidence](artifacts/decode-kernels-review.json).
+These regression and consistency checks do not qualify original unquantized-model
+accuracy or GGUF conversion.
+
+**The functional timing gate is not clean.** All 182 AR/MTP request cases pass
+correctness in both paired captures, with exact output and prompt/cache/prefill
+counts. After an additional unchanged-main control, AR `legacy-tool-cancel`
+single-token decode remains 44.63 ms versus 38.88–38.92 ms, and MTP
+`disk-spacing` 289-token continuation prefill remains 557.21 ms versus
+516.68–526.89 ms. Initial candidate samples were 159.66/951.43 ms.
+Other queue/snapshot timing flags remain inconclusive; the initial 58.25 s
+queue stall did not recur. The gate remains 5% and 3 ms per request/phase.
+Concurrent setup and maximum-token-gap flags are also retained in the evidence.
 
 | Check | Result |
 | --- | --- |
+| Wave-owned prefill weights, October 13 | Routed WMMA, projection/convolution, MoE epilogue and HC mix checks pass with unchanged tolerances. Routed inputs end at their allocation boundary; independently reset output tails retain their guards. Fused SSM output/state/replay and full fixed-history logits are exact. HTTP C1 pp2048/tg128, two AR captures with two repetitions and two mixed/repetitive MTP captures: 16 exact measured completions, including actual drafts. All request phases pass the timing gate; the anomalous first mixed-MTP control is excluded. |
+| Decode-kernel review, October 10 | All 13 operator tests and native snapshot/session/deep-execution checks pass. Independent MTP formulas: worst relative RMS 0.0007655 (limit 0.002), 41 reported comparisons over eight text/image states. Sampled replay, cancellation, C2/4/6/8 and RAM/disk restoration pass. [Evidence](artifacts/decode-kernels-review.json). |
+| Focused HTTP regression, October 10 | `state-edges`, `tool-agent`, `long-context`, `cache`, Flash AR/MTP only. Two main/PR pairs plus unchanged-main controls; no output or expected cache/prefill-work changes. Timing failures remain visible above and in the [evidence](artifacts/decode-kernels-review.json). |
+| Concurrency, October 10 | All 63 tg128 requests match fresh AR completions: 21 AR, 21 mixed MTP and 21 repetitive MTP at C1/2/4/6/8. Prepared prefixes are reused; mixed/repetitive MTP propose 882/2170 drafts and accept 517/1959. [Evidence](artifacts/decode-kernels-review.json). |
 | Real-image regression checks | 1024×1024 encoding passes. Nine main/candidate HTTP image, retry and continuation responses have identical outputs and token/cache counts. AR/MTP C4 image batching, sampled replay, cancellation and RAM/disk restoration pass. The disk fixture reprocesses only its seven-token assistant suffix; identical RAM retries require zero prefill. [Evidence](artifacts/prefill-long-context.json). |
 | Prefill kernels | Final build: 7,946,240 logits after 32,640 prompt tokens remain byte-identical to main (KL 0). The earlier deep-context gate reaches 259,938 tokens with exact logits. Independent GDN/projection/selector checks, ragged chunks and graph replay pass. [Evidence](artifacts/prefill-long-context.json). |
 | Mapped input and MTP catch-up | Exact Q8 projections, full/tail predictor stages and candidates; sampled output, acceptance, RAM/serialized replay and C2/4/6/8 state/RNG checks pass. Default sampling and thinking-off penalties are covered at d0/32K/128K. [Evidence](artifacts/prefill-long-context.json). |
-| HTTP depth sweep | All 24 pp2048/tg128 AR and mixed/repetitive MTP completions through d128K retain the previous sweep's output hashes and prompt/cache/draft counts. [Evidence](artifacts/prefill-long-context.json). |
+| HTTP depth sweep, October 10 | All 24 pp2048/tg128 AR and mixed/repetitive MTP completions through d128K match current main's output hashes and prompt/cache/draft counts. [Evidence](artifacts/decode-kernels-review.json). |
 | Unused final-layer outputs | Full-vocabulary logits match unpruned execution byte-for-byte through 133,120 tokens, also with mixed code/Unicode text and image input. Mixed batching and sampled RAM/serialized snapshot replay preserve logits and RNG state. [Evidence](artifacts/prefill-final-rows.json). |
 | Bounded selector scratch | After 133,824 prompt tokens, 15,892,480 logits are byte-identical to the previous build. Ragged chunks retain exact masks and the independent FP64 score check. [Evidence](artifacts/prefill-deep-context.json). |
 | Unused normalization removal | 15,892,480 logits are byte-identical to main; ragged residual-only fusion matches normalized fusion and the separate epilogue/combine. [Evidence](artifacts/prefill-normalization.json). |
@@ -108,10 +140,36 @@ weights. [Vision reproduction](../qwen3.8-27b/QUALITY.md#vision).
 
 ## Benchmark method
 
-Gufo pp/tg, concurrency and memory refreshed October 8–9, 2026 using the production
-Nix build of `50900eb7` plus the prefill optimizations. Binary and source hashes
-are retained in [model identities](artifacts/model-identities.json).
-Reference and loading results retain September 22–23 provenance.
+The October 13 single-user refresh uses production Nix builds of PR #571:
+`0951ea2f` (binary SHA-256 prefix `61d0583912d9e2c8`), and `ac51031a`
+(`d6cc00786ffc8786`) for AR d16K/d64K and MTP d64K, whose prompts end a few
+tokens past a 128-token tile and take its W8A8 tail path. Both run through
+`tools/bench/model-bench.py run --target gufo --table single-ar,single-mtp`:
+HTTP C1, capacity 133760, greedy, thinking off, pp2048/tg128 at
+every depth from 0 to 131072, one warmed sample per point, platform profile
+`performance`. Token and cache counts pass the driver's calibration gates.
+The single-user kernels behind it retain byte-identical logits for 718 fixed
+continuation rows after a 35,559-token prompt at batch 2048 and 4096 against
+the previous PR head ([experiments](EXPERIMENTS.md)). Multi-user, loading and memory
+tables and all reference values keep their earlier provenance.
+
+The October 10 sweep follows:
+
+Gufo refreshed October 10, 2026 using production Nix build `25cdb2a1`,
+PR #518 rebased onto main `a41e88da` with all 16 patches unchanged.
+Matched main controls use the same pinned toolchain, model and ordered workload
+histories. Binary and source hashes are retained in
+[model identities](artifacts/model-identities.json).
+All llama.cpp data retain September 22–23 provenance, unchanged at the user's
+request; no reference benchmark refresh was run.
+The largest displayed PP decrease versus main is 3.77%, at 64K MTP; no
+single-user PP row drops more than 5% versus main or the previous published
+table. A focused C1 PP-only retry at that frontier measured AR
+1467.30 → 1497.60 tok/s (+2.1%) and MTP 1451.39 → 1463.63 tok/s (+0.8%).
+Both builds used the saved prefix/messages and exact original token/cache counts,
+with one generated token. Fresh prefix/continuation pairs omit earlier cached
+branches, so these controls remain separate from the original ordered-sweep
+samples rather than replacing or averaging them. [Evidence](artifacts/decode-kernels-review.json).
 One warmed sample per point, greedy, thinking off, penalties disabled.
 Single-user uses pp2048/tg128; MTP pp is the maximum across mixed/repetitive
 workloads. Gufo capacity is 133760; reference capacity is 35456 through 32K,
@@ -121,11 +179,16 @@ reevaluated. Rates sum individual decode rates.
 Depth calibration depends on the ordered sweep. Paired speed controls use
 the same depth list. Deep AR/MTP HTTP cache frontiers differ by one token;
 exact replay is checked separately with identical prefill boundaries.
-AR reference is llama.cpp b11069; MTP uses pinned `6fcaa16f`.
-The historical C2 repetitive rate was not reproduced: current main measured
-84.46 tok/s, versus 84.52 in this sweep and 84.40 in a focused repeat. The original
-sweep sample is retained; this difference is not introduced by the prefill changes.
-Loading: cold files, C1/MTP/capacity 262144. Memory: C1/AR/capacity 133121,
+AR reference is llama.cpp b11069; historical MTP data use pinned `6fcaa16f`.
+A separate prerequisite check on October 10 used that same MTP binary in AR
+and MTP modes at pp2048/tg128, C1/capacity 4096. Mixed-prose fresh and prepared
+MTP outputs matched each other but differed from its own AR output; both
+generated 128 tokens and MTP proposed 152 drafts. Repetitive MTP was not
+attempted after this failure. The retained historical speed values are not
+new equivalence-qualified measurements. [Evidence](artifacts/decode-kernels-review.json).
+Loading: cold files verified with `POSIX_FADV_DONTNEED` and `mincore` on every
+target/sidecar file, C1/MTP/capacity 262144; runtime libraries may remain warm.
+Memory: C1/AR/capacity 133121,
 peak global HIP allocation including idle memory. Full commands, counts and
 identities remain in [artifacts](artifacts/bench.json) and the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).

@@ -31,12 +31,15 @@ struct ModelWeights;
 struct MtpWeights;
 class NgramTable;
 struct MtpCandidateLogits;
+class ContinuationAdapter;
+class ContinuationHooks;
 namespace rocm {
 class Communicator;
 class DeviceModel;
 class Executor;
 class Session;
 class SnapshotState;
+struct PrefillCheckpoint;
 }  // namespace rocm
 
 struct ModelOptions {
@@ -141,6 +144,7 @@ private:
   MtpBatchController batch_policy_;
 
   friend class Session;
+  friend class ContinuationAdapter;
 };
 
 /// One conversation's context. Sync feeds a prompt (reusing whatever prefix
@@ -231,7 +235,7 @@ public:
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
-  void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
+  void ResetDraftPolicy();
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};
@@ -268,18 +272,25 @@ public:
 
 private:
   friend class Model;
+  friend class ContinuationAdapter;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
+
+  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
+  bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
+                             const PrefillCapture&, std::string*);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
             double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {});
+            std::span<const std::int32_t> after = {},
+            const PrefillCapture& capture = {});
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
                 double* capture_ms = nullptr,
-                std::span<const std::int32_t> next = {});
+                std::span<const std::int32_t> next = {},
+                const PrefillCapture& capture = {});
   std::unique_ptr<SessionSnapshot> SaveSnapshotImpl(
       const rocm::Session& state, std::span<const std::int32_t> tokens,
       std::span<const float> logits, std::uint32_t hidden_rows,
@@ -326,6 +337,7 @@ private:
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;
   bool valid_{true};
+  ContinuationHooks* continuation_hooks_{nullptr};
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 

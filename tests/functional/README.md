@@ -3,6 +3,68 @@
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries and local weights; no models are downloaded.
 
+The cluster workflow uses [impact.json](impact.json) to select suites from changed
+paths. Inspect a plan locally without running Gufo:
+
+```sh
+python3 tests/functional/impact.py --model flash-next-q4 \
+  src/models/qwen38_flash_next/continuation_adapter.cpp
+```
+
+`--repo PATH --base SHA --head SHA` reads a Git diff instead. Renames retain both
+old and new ownership. Rules with the highest explicit priority apply; equal
+priority rules contribute a union. Unknown paths expand to all compatible
+coverage. Suite metadata must cover every name in `run.py`; dependencies are
+deliberately conservative, so even narrow source rules can select many suites.
+
+`Devlab functional checks` starts when a maintainer applies `ci:functional` to a
+PR, or manually dispatches it with a PR number. The label event uses trusted base
+workflow code (`pull_request_target`); only Maintain/Admin senders and rerun
+actors authorize execution. The event's exact PR head must still be current.
+Later commits do not inherit approval: remove and reapply the label to approve
+another revision. It pins the PR head and merge base on `main`, plans on a hosted runner,
+and allocates the cluster only for affected Flash-Next MTP coverage (or an
+explicit benchmark request). AR suites run only when a dispatch sets `ar`, which
+plans with `--model flash-next-q4`; the default is `--model flash-next-q4/mtp`.
+`--model` accepts a model or a single `model/mode` profile. The workflow and harness come from the trusted
+workflow revision; only the production binary is built from the approved PR.
+It fetches the pinned Q4 shards, MTP sidecar and vision projector into a persistent
+cache under `$GUFO_CI_CACHE` (default `$RUNNER_TOOL_CACHE/gufo`; the weights need
+about 110 GiB free), and retains reports and selection reasons as artifacts.
+Weight and `ccache` reuse depend on the cluster preserving that directory on the
+allocated machine. A benchmark request also builds the merge base and runs the
+same AR sweep on it first, so the report shows per-depth deltas; one sweep per
+revision is an observation, not a qualified timing regression.
+
+The cluster installs the client from `requirements.txt`, pinned to the flake's
+versions, because newer unpinned SDKs break every suite inside the client. Keep it
+covering every third-party import here; the install step imports the harness
+to catch gaps.
+
+A hosted `report` job then updates a single PR comment with results, failure
+log tails and benchmark deltas, sets the `devlab/functional` commit status and
+removes `ci:functional`. The status is advisory: it is not a required check, so
+a broken cluster never blocks merging. Suite failures report `failure`; cluster
+or harness problems (authorization, build, download, cancellation) report
+`error`. The PR write token stays on the hosted runner.
+
+`cluster.py` executes each configuration group with a fresh server/cache history
+and continues to other groups after a failure, removing each group's disk cache
+once it finishes. Candidate correctness uses
+`--record-baseline` to capture observations; this does **not** qualify timing
+regressions. Failures fail the cluster job. Deferred cache rollout suites,
+other-model coverage, numerical checks and agent-client replays remain named
+qualification obligations rather than being counted as passes. This workflow
+currently covers only Flash-Next, including for shared changes.
+
+Planner and executor checks are CPU-only:
+
+```sh
+python3 -m unittest discover -s tests/functional -p test_impact.py
+python3 -m unittest discover -s tests/functional -p test_report.py
+```
+
+
 Device-loss process tests use a separate opt-in runner because each lost-device
 case must terminate its server. Build its CMake-owned preload helper, then run
 against a production binary and one explicitly selected model/mode:
@@ -86,17 +148,21 @@ RAM, disk and restart settings once their contracts pass.
 | `responses` | SDK buffered, streaming and async Responses |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
-| `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery |
+| `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
+| `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
 | `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
+| `tool-streaming` | Incremental argument arrival and exact assembly in Chat/Responses/Messages; stable IDs, literal framing, thinking, stopped/limited calls and successful retries |
 | `reasoning-separator` | No leading separator newlines after reasoning in Chat/Responses, plain/tools/JSON; exact streamed/buffered text, warm retry, continuation and thinking-off paragraph breaks |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `messages-tools` | Messages `tool_use` call, `tool_result` replay with cache reuse, buffered and streamed events, and an uncached Chat control of the same prompt |
+| `messages-count-tokens` | Counts match complete Messages prompt usage with system/history, Unicode, all tool choices and thinking; cold/warm cache counts, no inference side effects, over-context sizing and request errors |
+| `messages-image-counts` | Image counts match buffered/streamed Messages usage, including tool results, warm caches, PNG/JPEG/WebP, multiple images, Unicode and over-context sizing; no inference side effects; text-only models reject image counts and generation. Requires `--expected-input-modalities text,image` with a projector, or `text` for capability rejection checks |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
@@ -134,10 +200,19 @@ fixed images and are included in `all` only with that option. `image-count`
 restarts the server for disk replay; its first four cases are 1/16-image timing
 controls usable on older main with `--through-case image-count:image_count_control_16_True`.
 
+`tool-images` also requires `--mmproj`. For matched existing-behavior timing
+controls on main, stop at
+`--through-case tool-images:tool_images_control_complete`; full candidate runs
+continue into the newly supported image-bearing tool outputs. A text-only
+model must not qualify the image suite by skipping its assertions.
+
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
 uses its own 8 GiB disk budget and 1 GiB staging area inside the output directory;
 the runner removes that disk cache when the run ends, keeping reports and logs.
+Flash-Next allocates that staging as pinned host memory at startup, beyond its
+RAM budget, although its default 1 MiB transfer buffer suffices. The runner
+keeps 1 GiB so results stay comparable with retained runs and other models.
 For timing controls on revisions predating progress, use `--allow-missing-progress`
 with `--record-baseline`. Candidate qualification always requires progress events.
 Model runs stay outside hosted CI; CI checks the runner and measurement logic.
@@ -184,6 +259,27 @@ commands in disposable fixtures using isolated Pi configuration. Use `--passes 1
 for a focused check; the default five passes matches the reported debug workload.
 `--conversation --context-file FILE` additionally tests retained long history.
 
+For Claude Code sessions over `/v1/messages`, run `claude_code_agent.py` with
+`--base-url`, `--model`, `--claude /path/to/claude`, `--server-log` and a fresh
+`--output` directory outside any project that has a `CLAUDE.md` (the CLI would
+read it). It runs the real CLI non-interactively with its `Read`, `Write`,
+`Edit` and `Bash` tools allowed, an isolated home and configuration, and every
+model alias mapped to `--model`, through the same recording proxy. The
+`simple`, `tools`, `edit` and `literal-protocol` tasks match Pi's and are
+verified the same way: files and generated code directly, the CLI's
+stream-json transcript for tool use and framing leaks, and the server log for
+completed requests and cache reuse on every later agent turn. Claude Code ends
+each request with a `system` message whose copy differs in the next request,
+so later turns reuse the prompt up to that message, not the whole previous
+prompt.
+
+For image tool results, explicitly select `--case image-read --passes 1` with
+a vision-capable model. The task opens a fixture through Pi's real `read`
+tool and checks both the returned image pixels and the model's color answer.
+Run with `--api openai-responses` and `--api openai-completions` to check both
+client transports; retain the wire requests to inspect the image placement.
+This image task is excluded from the default text-task list.
+
 For a conversation that **actually grows past 200K tokens through tool results**,
 run `agent_long.py --agent pi|opencode --executable PATH --base-url URL
 --model NAME --output DIR --min-context 201000 --complex-tools --stress-turns 20`
@@ -197,6 +293,19 @@ the previous prompt plus generated tokens; transcripts
 and phase timings are retained. No synthetic system-padding counts as growth.
 If Pi omits a reasoning-only reply, the report identifies that history change
 and verifies reuse through the measured pre-generation boundary instead.
+Use `--resume PREVIOUS_OUTPUT` to continue either client's retained session,
+including after a server restart. To test cancellation, add `--interrupt tool`
+or `--interrupt thinking` to a resumed run. The harness sends SIGINT only after
+observing that phase in a live stream and records the interruption separately.
+Then resume that output directory without `--interrupt`. The harness preserves
+the unfinished task and its files, and requires successful tool execution and
+state/digest checks without repeating committed changes. An interrupted run
+alone is not a pass. Resume prompts distinguish completed calls for this task
+from earlier transactions; the checks still require the file read and catalog
+query, even when the model could infer their contents from earlier tasks.
+Use `--interrupt-after-tools 5` with `--complex-tools --interrupt tool` to
+interrupt the receipt after the transaction has committed. Resuming must
+preserve the committed revision and finish the receipt without another apply.
 
 `opencode_agent.py` runs real opencode (`--opencode PATH`, default on `PATH`)
 against a local server with `--base-url`, `--model` and a fresh `--output`.
@@ -240,9 +349,11 @@ not a real client's summary generation or retention under RAM/disk pressure.
 The [card 01 results](../../docs/cache-redesign/cards/01-functional-coverage.md#results)
 record all scenario families, including failures on the legacy cache.
 
-Run `cache-transforms` with a roomy RAM budget in its own invocation. The
-tool-bearing template can have a longer assistant opening than the plain
-conversation; the suite checks zero-prefill retries without adding pressure.
+Run `cache-transforms` with a roomy RAM budget in its own invocation. Its
+retried prompts end with a user turn after a tool result, and Qwen templates
+place the stable boundary before such a turn, so under pressure an unchanged
+retry prefills that turn as well as the assistant opening. The suite therefore
+checks zero-prefill retries without adding pressure.
 `cache-pressure` instead runs explicitly with `--cache-ram-bytes 2147483648`,
 `--context 32768`, and `--sessions 2` (also supports one session, with sequential
 children). It verifies that background requests published at least twice the
@@ -270,7 +381,7 @@ nix develop -c python3 tests/functional/cache_lifecycle.py \
   --context 32768 --sessions 1 --think off --speculative off
 ```
 
-Repeat `--case restart|tiered|oversized|crash` to select cases. `restart` models
+Repeat `--case restart|tiered|oversized|crash|side-traffic` to select cases. `restart` models
 llama-swap stopping and starting a server between turns. `tiered` first warms a
 short RAM prefix after restart, then requests a history with a deeper published
 disk checkpoint. `oversized` uses 1 MiB staging beneath an observed larger
@@ -280,6 +391,30 @@ request, then SIGKILLs that child. Restart may restore only previously published
 boundaries. The helper is disarmed for initial publication and is covered by
 CPU process tests. Every case owns an 8 GiB disk budget, checks free space and
 deletes its cache on completion/failure. Reports and logs remain outside Git.
+For the 100K+ case, use `--seed-lines 7300 --minimum-published-tokens 100000`
+with context 133760, selecting `oversized` and `crash`. Actual prompt usage,
+publication and disk restoration must meet that depth; line count alone is
+not evidence. `--publication-timeout 300` allows the large checkpoint to finish
+before the deliberate crash without changing request timing gates. The
+oversized case waits for the deep publication before graceful shutdown and
+still uses 1 MiB staging. Keep the same explicit RAM limit in both modes.
+Use `--staging-bytes` to match the staging budget of a reported restart,
+tiered or crash workload (default: 2 GiB). This value is recorded in the
+report; the oversized case always keeps its 1 MiB staging allocation.
+For checkpoints larger than committed RAM, use `--require-over-ram` with
+`--case oversized` or `--case side-traffic`. For example, Flash-Next at context 262144 with
+`--seed-lines 12500 --minimum-published-tokens 174000` and
+`--cache-ram-bytes 4593364992` exercises a 175K seed and a 186K continuation.
+The assertion compares the published payload with the server's actual
+post-allocation RAM budget; a queued job alone does not qualify the case.
+`side-traffic` keeps the system prompt at at most 256 background lines and
+places the remaining seed in the user history. After publishing the deep append
+and restarting, it alternates four short conversations sharing that system with
+one further deep turn, for three rounds. Every deep turn must retain at least
+the last published boundary; each new deep publication must advance before the
+next round. Cold output controls run after all warm traffic. This covers the
+short-peer/deep-history pattern reported in #542; the system-only oversized
+fixture cannot establish that behavior.
 Known cache-work failures exit nonzero and retain controls/evidence; they are
 not skipped, marked as expected passes, or fixed in this test-only card.
 

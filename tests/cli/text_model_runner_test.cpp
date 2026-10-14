@@ -75,12 +75,15 @@ public:
       : stats_(std::move(stats)), measured_bytes_(measured_bytes) {}
 
   void SetCancellationCheck(const CancellationCheck& is_cancelled) override {
+    cancellation_armed = static_cast<bool>(is_cancelled);
     if (is_cancelled) {
       ++stats_->cancellation_bindings;
     } else {
       ++stats_->cancellation_clears;
     }
   }
+
+  bool cancellation_armed{false};
 
   void Invalidate() noexcept override {
     ++stats_->invalidations;
@@ -297,6 +300,40 @@ public:
 private:
 };
 
+void TestPromptCountingValidatesCapabilitiesBeforeInference() {
+  const auto stats = std::make_shared<FakeStats>();
+  FakeRunner runner(stats);
+  ChatRequest request;
+  Expect(!runner.CountPromptTokens(request),
+         "unsupported template has no count");
+  gufo::tokenization::ChatMessage message;
+  message.role = gufo::tokenization::ChatRole::kUser;
+  message.content = std::string(runner.Descriptor().max_context + 1, 'x');
+  request.messages.push_back(message);
+  Expect(runner.CountPromptTokens(request) == message.content.size(),
+         "counting accepts text beyond the execution context");
+  // A text renderer can ignore images. Counting must reject them first,
+  // including images carried by a tool result.
+  for (const auto role : {gufo::tokenization::ChatRole::kUser,
+                          gufo::tokenization::ChatRole::kTool}) {
+    auto& input = request.messages.front();
+    input.role = role;
+    input.images = {{0, std::make_shared<const std::vector<std::uint8_t>>(
+                            std::initializer_list<std::uint8_t>{1})}};
+    bool rejected = false;
+    try {
+      (void)runner.CountPromptTokens(request);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Expect(rejected,
+           "text-only counting rejects images instead of dropping them");
+  }
+  Expect(stats->states_created == 0 && stats->prefill_spans.empty() &&
+             stats->advanced_tokens.empty(),
+         "counting never creates execution state or runs inference");
+}
+
 void TestBoundedPrefillDecodeAndPrefixReuse() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
@@ -481,6 +518,23 @@ public:
   }
 };
 
+class PartialRetentionRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = SnapshotRunner::Descriptor();
+    descriptor.capabilities.partial_prefill_retention = true;
+    return descriptor;
+  }
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    armed_during_prefill.push_back(RequireFakeState(state).cancellation_armed);
+    return SnapshotRunner::Prefill(state, prompt, offset, max_input_tokens);
+  }
+  mutable std::vector<bool> armed_during_prefill;
+};
+
 class InPassRunner final : public SnapshotRunner {
 public:
   using SnapshotRunner::SnapshotRunner;
@@ -502,7 +556,9 @@ public:
   TextPrefillStep PrefillThrough(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget, std::size_t boundary,
-      std::unique_ptr<TextRunnerSnapshot>* checkpoint) const override {
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+      const std::function<std::unique_ptr<TextRunnerSnapshot>()>&)
+      const override {
     ++stats_->snapshot_captures;
     *checkpoint = std::make_unique<FakeSnapshot>(boundary, 0, 90);
     auto step = FakeRunner::Prefill(state, prompt, offset, budget);
@@ -928,6 +984,41 @@ void TestGeneratedFrontierPersistsForForks() {
   Expect(resumed.cache_disk_hit() && resumed.cached_prompt_tokens() == 3 &&
              resumed.Prefill(16).consumed_tokens == 2,
          "spaced disk checkpoints resume from the nearest stored prefix");
+}
+
+void TestCancelledPrefillRetainsCompletedChunks() {
+  for (const bool retains : {false, true}) {
+    auto stats = std::make_shared<FakeStats>();
+    const auto partial =
+        std::make_shared<PartialRetentionRunner>(stats, 64, 256, 1);
+    std::shared_ptr<TextModelRunner> runner =
+        retains ? std::static_pointer_cast<TextModelRunner>(partial)
+                : std::make_shared<SnapshotRunner>(stats);
+    TextRunnerPool pool(runner, 1);
+    auto request =
+        pool.Acquire({1, 2, 3, 4, 5, 6}, {}, [] { return false; }, {}, true, 5);
+    const auto bindings = stats->cancellation_bindings;
+    const auto step = request.Prefill(4);
+    Expect(step.consumed_tokens == 4 && !step.decode_ready,
+           "the first chunk does not complete the prompt");
+    if (retains) {
+      Expect(partial->armed_during_prefill == std::vector<bool>{false} &&
+                 stats->cancellation_bindings == bindings + 1,
+             "a prefill step runs to completion and re-arms the cancellation");
+    }
+    request.Cancel();
+    auto continuation =
+        pool.Acquire({1, 2, 3, 4, 5, 6, 7}, {}, {}, {}, true, 6);
+    if (retains) {
+      Expect(continuation.cached_prompt_tokens() == 4 &&
+                 continuation.cache_restore_bytes() == 0,
+             "a prefill cancelled between chunks keeps its live prefix");
+    } else {
+      Expect(continuation.cached_prompt_tokens() == 0,
+             "runners without the capability discard a partial prefill");
+    }
+    continuation.Invalidate();
+  }
 }
 
 void TestCancellationRetainsOnlyCompletedWork() {
@@ -2220,6 +2311,7 @@ void TestServerInstructionsAreFraming() {
 }  // namespace
 
 int main() {
+  TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
@@ -2230,6 +2322,7 @@ int main() {
   TestGeneratedFrontierForksBeforeMutation();
   TestGeneratedFrontierPersistsForForks();
   TestCancellationRetainsOnlyCompletedWork();
+  TestCancelledPrefillRetainsCompletedChunks();
   TestPromptReuseCanBeDisabledPerRequest();
   TestStableChatPrefixSurvivesInterruptedFraming();
   TestWarmChatCheckpointsStopAtTheStableBoundary();

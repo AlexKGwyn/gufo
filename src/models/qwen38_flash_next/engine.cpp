@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -270,8 +271,6 @@ std::uint32_t Model::PrefillPairLead(std::uint32_t tokens) const noexcept {
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
-  if (options_.tp_world_size > 1)
-    return PrefillCapacity();
   return std::min(kPrefillChunkTokens + kPrefillTailTokens,
                   options_.max_context);
 }
@@ -330,6 +329,12 @@ Session::Session(std::shared_ptr<Model> model,
 
 Session::~Session() = default;
 
+void Session::ResetDraftPolicy() {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
+  draft_length_.Reset();
+}
+
 std::uint32_t Session::Position() const noexcept {
   return session_->position();
 }
@@ -338,12 +343,16 @@ std::uint32_t Session::ContextSize() const noexcept {
 }
 
 void Session::Reset() {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeReset();
   valid_ = false;
   session_->Reset();
   tokens_.clear();
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
+  if (continuation_hooks_)
+    continuation_hooks_->AfterReset();
   valid_ = true;
 }
 
@@ -353,6 +362,8 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())
                                : std::span<const std::uint8_t>{};
   if (!tokens_.empty() &&
@@ -454,6 +465,8 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeRestore();
   return RestoreSnapshotImpl({snapshot.data_.get(), snapshot.size_},
                              snapshot.deferred_.get(), error_msg);
 }
@@ -468,6 +481,8 @@ std::uint64_t SessionSnapshot::DeviceBytes() const {
 
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeRestore();
   return RestoreSnapshotImpl(payload, nullptr, error_msg);
 }
 
@@ -647,7 +662,8 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
-                   double* capture_ms, std::span<const std::int32_t> after) {
+                   double* capture_ms, std::span<const std::int32_t> after,
+                   const PrefillCapture& consume) {
   rocm::Executor& exec = *model_->executor_;
   // The final pass may take the prompt's tail; earlier ones whole chunks.
   const std::size_t widest = prefill ? exec.PrefillChunk() : exec.max_batch();
@@ -666,7 +682,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill
                               : rocm::Executor::ForwardMode::kDecode;
     std::unique_ptr<rocm::PrefillCheckpoint> capture;
-    if (checkpoint && boundary > tokens_.size() &&
+    if ((checkpoint || consume) && boundary > tokens_.size() &&
         boundary <= tokens_.size() + n) {
       capture = exec.MakePrefillCheckpoint(
           *session_, chunk,
@@ -693,17 +709,21 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     if (capture) {
       const auto started = std::chrono::steady_clock::now();
-      *checkpoint = SaveSnapshotImpl(
-          *capture->state,
-          std::span<const std::int32_t>(tokens_).first(boundary),
-          capture->logits, capture->hidden_rows, error_msg,
-          SnapshotMode::kBorrowed);
-      if (capture_ms)
-        *capture_ms += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - started)
-                           .count();
-      if (!*checkpoint)
-        return false;
+      if (consume) {
+        consume(*capture);
+      } else {
+        *checkpoint = SaveSnapshotImpl(
+            *capture->state,
+            std::span<const std::int32_t>(tokens_).first(boundary),
+            capture->logits, capture->hidden_rows, error_msg,
+            SnapshotMode::kBorrowed);
+        if (capture_ms)
+          *capture_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+        if (!*checkpoint)
+          return false;
+      }
     }
     off += n;
   }
@@ -712,6 +732,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
 
 bool Session::Sync(std::span<const std::int32_t> prompt, std::string* error_msg,
                    std::span<const std::int32_t> next) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   return SyncImpl(prompt, error_msg, 0, nullptr, nullptr, next);
 }
 
@@ -719,6 +741,8 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
                           std::uint32_t boundary,
                           std::unique_ptr<SessionSnapshot>* checkpoint,
                           std::string* error_msg, double* capture_ms) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (!checkpoint || boundary == 0 || boundary > prompt.size() ||
       prompt.size() - boundary > 8 || boundary <= tokens_.size()) {
     AssignError(error_msg,
@@ -731,10 +755,27 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
   return SyncImpl(prompt, error_msg, boundary, checkpoint, capture_ms);
 }
 
+bool Session::SyncThroughComponents(std::span<const std::int32_t> prompt,
+                                    std::uint32_t boundary,
+                                    const PrefillCapture& capture,
+                                    std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
+  if (!capture || boundary == 0 || boundary > prompt.size() ||
+      prompt.size() - boundary > 8 || boundary <= tokens_.size()) {
+    AssignError(
+        error_msg,
+        "component checkpoint must extend the frontier in the text tail");
+    return false;
+  }
+  return SyncImpl(prompt, error_msg, boundary, nullptr, nullptr, {}, capture);
+}
+
 bool Session::SyncImpl(std::span<const std::int32_t> prompt,
                        std::string* error_msg, std::uint32_t boundary,
                        std::unique_ptr<SessionSnapshot>* checkpoint,
-                       double* capture_ms, std::span<const std::int32_t> next) {
+                       double* capture_ms, std::span<const std::int32_t> next,
+                       const PrefillCapture& capture) {
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -761,12 +802,14 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   }
   valid_ = false;
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
-                       checkpoint, capture_ms, next);
+                       checkpoint, capture_ms, next, capture);
   valid_ = ok;
   return ok;
 }
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1026,6 +1069,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
                          std::string* error_msg, bool stop_at_eos) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1097,6 +1142,13 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
       valid = false;
     if (!valid) {
       outcome.error = "invalid or non-independent batch request";
+      continue;
+    }
+    try {
+      if (r.session->continuation_hooks_)
+        r.session->continuation_hooks_->BeforeExecution();
+    } catch (const std::exception& exception) {
+      outcome.error = exception.what();
       continue;
     }
     if (!r.session->session_->CheckCancellation(&outcome.error))

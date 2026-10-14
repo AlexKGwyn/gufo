@@ -71,6 +71,34 @@ CPU (several cores in kernel workers) and latency per exchange. The links
 must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
 `/sys/bus/thunderbolt/devices/*/` after plugging.
 
+Three things that broke a boot-time setup (Ubuntu 26.04, rdma-core 61.0):
+
+- `insmod` of a built `thunderbolt_ibverbs.ko` fails with "Unknown symbol"
+  unless `ib_core` and `ib_uverbs` are loaded first
+  (`modprobe -a ib_core ib_uverbs`); `modprobe` of an installed module loads
+  them itself.
+- rdma-core's `60-rdma-persistent-naming.rules` renames the new devices, which
+  broke their uverbs nodes. Copy it to `/etc/udev/rules.d/` and add
+  `KERNEL!="usb4_rdma*"` to its `rdma_rename` line.
+- The devices register only after both hosts have loaded the driver. After a
+  reload on both hosts this took more than 180 s, so a fixed sleep is not
+  enough: wait for `ACTIVE` in `/sys/class/infiniband/<device>/ports/1/state`,
+  and let the supervised ranks keep retrying.
+
+On a kernel that does not export `tb_ring_throttling()` (Ubuntu 26.04's
+7.0.0-38 does not), the driver logs "optional tb_ring_throttling() helper
+unavailable; using stock NHI interrupt throttling" and ignores
+`nhi_interrupt_throttle_ns`, so the rings keep the stock 128 µs interrupt
+throttling and decode is bound by the exchange latency. There, `ib_write_lat`
+measured a typical 65.3 µs per exchange for both 64 B and 16 KiB, and
+`ib_write_bw` 31.86 Gbit/s. With a rebuilt `thunderbolt` module that adds
+the helper, plus donnerkeule's kernel patch
+`0004-thunderbolt-nhi-clear-pending-before-unmask.patch`, it measured 8.5 µs
+(64 B), 28 µs (16 KiB) and 40.5 Gbit/s. One greedy Q8 + MTP request then
+decoded at 42.8 instead of 34.7 tok/s (median of three runs each, both with
+the MTP draft policy on its one-session costs; see gufo-org/gufo#258). Check
+`dmesg` for that line.
+
 Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
 sequences, tool calls, images (`--mmproj` on both ranks), cancellation,
 `--request-timeout-ms`, history reuse and the disk cache (`--cache-disk` on
@@ -93,7 +121,9 @@ Limits:
   wait on a throttled SSD, is waited for up to 3 minutes.
 - Each session holds a full-context state on each rank. Full Q8 (six `Q8_0`
   shards, which do not fit one host) at 262,144 tokens uses 87 GB of each
-  host's 127 GB GPU memory with four sessions and 103 GB with eight.
+  host's 127 GB GPU memory with four sessions and 103 GB with eight. Nine
+  failed to load on rank 0 (`text runner request-state claim exceeds state
+  capacity`) while rank 1 loaded nine at 107.5 GiB.
 - Logits differ slightly from one host's (reduction order; see the
   measurements in EXPERIMENTS.md), so a close choice can go the other way. In
   the `tool-reasoning` suite's case with `<|im_end|>` inside a tool argument,

@@ -1690,12 +1690,6 @@ int RunServe(std::span<const char* const> args) {
       }
     });
   }
-  const auto stop_pair_watch = [&serving, &pair_watch] {
-    serving.store(false, std::memory_order_release);
-    if (pair_watch.joinable()) {
-      pair_watch.join();
-    }
-  };
   // Releasing model state on a lost device crashes; the kernel reclaims it.
   // The backend is checked as well: an external SIGTERM can stop the server
   // after the scheduler records the loss but before a request fires the hook.
@@ -1704,14 +1698,19 @@ int RunServe(std::span<const char* const> args) {
       ::_exit(kDeviceLostExitStatus);
     }
   };
+  const auto finish_pair_watch = [&] {
+    serving.store(false, std::memory_order_release);
+    if (pair_watch.joinable())
+      pair_watch.join();
+  };
   try {
     server.run(/*handle_signals=*/true);
   } catch (...) {
-    stop_pair_watch();
+    finish_pair_watch();
     exit_if_device_lost();
     throw;
   }
-  stop_pair_watch();
+  finish_pair_watch();
   exit_if_device_lost();
   return 0;
 }

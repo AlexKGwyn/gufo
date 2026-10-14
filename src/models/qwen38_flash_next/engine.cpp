@@ -270,6 +270,8 @@ std::uint32_t Model::PrefillPairLead(std::uint32_t tokens) const noexcept {
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
+  if (options_.tp_world_size > 1)
+    return PrefillCapacity();
   return std::min(kPrefillChunkTokens + kPrefillTailTokens,
                   options_.max_context);
 }
@@ -386,7 +388,7 @@ std::uint64_t Session::SnapshotBytes() const {
 }
 
 std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
-  if (!session_->VisionLayout().images.empty())
+  if (model_->TpWorldSize() > 1 || !session_->VisionLayout().images.empty())
     return 0;
   return SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
          model_->executor_->PrefillCheckpointBytes(*session_, position);

@@ -165,6 +165,8 @@ public:
   /// Why the instruction channel failed, or empty while it works.
   [[nodiscard]] std::string Failure() const;
 
+  [[nodiscard]] DeviceProbeStatus PollDevice() const override;
+  [[nodiscard]] bool DeviceUsable() const override;
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override;
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override;
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override;

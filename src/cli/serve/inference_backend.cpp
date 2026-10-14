@@ -2767,6 +2767,9 @@ public:
       const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget,
       std::size_t boundary) const override {
+    // TP control mirrors bounded prefill and separate capture operations.
+    if (distributed_)
+      return std::nullopt;
     const auto& qfn = RequireQwenFlashNextState(state);
     const auto consumed = std::min<std::size_t>(
         {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
@@ -4189,7 +4192,7 @@ std::string InferenceBackend::model_id() const {
 
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
-  return impl_->Snapshot() != nullptr && tp_failure().empty();
+  return impl_->Snapshot() != nullptr && tp_failure().empty() && !device_lost();
 #else
   return false;
 #endif

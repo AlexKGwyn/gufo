@@ -1,5 +1,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>

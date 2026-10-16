@@ -13,7 +13,9 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This is the **Gufo RDMA version** adding support for Dual Strix Halo systems with InfiniBand, RoCE v2 or USB4 (Thunderbolt) cables between them. Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
+> This is the **Gufo RDMA version** adding support for Dual Strix Halo systems with InfiniBand, RoCE v2 or USB4 (Thunderbolt) cables between them.
+> For 2x USB4 cables, use this with [Donnerkeule](https://github.com/neuhaus/donnerkeule) and kernel 7.2+.
+> Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
 
 ## Models and benchmarks
 

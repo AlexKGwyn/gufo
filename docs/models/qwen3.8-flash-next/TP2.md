@@ -71,6 +71,44 @@ CPU (several cores in kernel workers) and latency per exchange. The links
 must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
 `/sys/bus/thunderbolt/devices/*/` after plugging.
 
+#### Device windows over USB4
+
+The speedup needs the experimental driver mode of thunderbolt-ibverbs
+(branch `codex/gpu-verbs-checkpoint`, not the default), loaded on both hosts
+with `dmabuf_verbs=1 dmabuf_push_done=1 dmabuf_credits=1` (direct post is on by
+default there). With it a GPU window registers as a DMA-BUF, the receiver's
+posted windows arm SEND credits, and the sender skips the per-exchange PREPARE
+round trip. The stock driver refuses `ibv_reg_dmabuf_mr`, so Gufo logs
+`windows=host_write (ibv_reg_dmabuf_mr: Operation not supported)` and runs as
+before; the driver mode never changes results, only exchange latency.
+Both ranks must run the same Gufo build (bootstrap wire version 8) and agree on
+the driver mode, or the pair falls back to host windows.
+
+`qwen38_flash_next_tp_batched_probe --allreduce-bench N` times the exchange,
+checks every sum exactly and prints the transport. fuzzy/misty, two USB4
+cables, p50 of 1000 exchanges per size, alternating runs, all sums verified:
+
+| Rows | Host windows (write) | Device windows (send, credits, direct post) |
+| ---: | ---: | ---: |
+| 1 | 32.0 µs | 29.5 µs |
+| 2 | 41.8 µs | 31.8 µs |
+| 8 | 54.6 µs | 45.6 µs |
+| 512 | 1419 µs | 1316 µs |
+
+On the stock driver (host windows) with the final build, the same probe gave
+31.4, 40.9, 51.3 and 1443 µs on rank 0 (one run).
+
+End to end on the stock driver (host windows), Q8 MTP, greedy, an empty prompt
+cache per server start, three starts each of the branch and its base,
+alternating: all four short and all four long (4.9k to 12k tokens, 384-token
+answers) outputs equal the previous build's token for token. Median short
+decode was 41.3 to 45.4 tok/s on the branch against 42.3 to 45.8 on its base;
+a 3.2k-token prefill took 2.63 s on both (the first start of a session 2.93 s
+for the branch), and the four long prefills differed by less than run-to-run
+noise (for example 12k tokens: 8.47 to 8.76 s against 8.40 to 8.59 s, one base
+start 13.3 s). The deferred send completion and the yielding spins therefore
+cost nothing measurable on the host path.
+
 Three things that broke a boot-time setup (Ubuntu 26.04, rdma-core 61.0):
 
 - `insmod` of a built `thunderbolt_ibverbs.ko` fails with "Unknown symbol"
@@ -167,6 +205,39 @@ header carries the call's scope, an ordinal and the byte count; a mismatch
 poisons the communicator. A sum of two operands keeps both ranks bit-identical;
 TP2 and one host differ by reduction order. HIP graphs are off under TP2.
 
+**Device windows.** When both ranks can register GPU memory with the RDMA
+device as a DMA-BUF (`ibv_reg_dmabuf_mr`), the three windows live in uncached
+device memory and each exchange is a SEND with immediate data into a receive
+the peer posted for that window, instead of a write into host memory. A window's
+receive is posted when its previous use has been read: when this rank sends
+the exchange two before the window's next use, after the add that last read it.
+The partial starts at the window (direct placement into GPU memory needs a
+page-aligned offset), so there is no header: the completion's length (padded to
+32 bytes) and an immediate derived from the call's scope and the exchange's
+ordinal replace the header's size and identity checks, and a mismatch poisons
+the communicator as before. The stage kernel writes the send window and the
+NIC reads it, and the NIC writes the receive window and the add reads it, with
+no cache between them; hence the uncached allocation.
+
+The ranks agree on the placement during the bootstrap and log it in
+`event=rdma_ready` as `windows=gpu_send`. If either rank's device refuses the
+registration, both keep the host windows and writes with immediate data of the
+sections above and log `windows=host_write (reason)`, for example
+`ibv_reg_dmabuf_mr: Operation not supported` on the stock USB4 driver. No option
+selects it. The bootstrap's wire version is 8: a rank running an older build
+refuses to pair, so **both hosts must run the same build**.
+
+**Waiting.** An exchange finishes when the peer's partial has arrived and this
+rank's *earlier* sends have completed, not its own: that completion follows the
+peer's acknowledgement (host windows) or placement report (device windows),
+both after the partial arrived. The send window is reused three exchanges
+later, after the next exchange has collected the completion, and a failed send
+fails that next exchange. The communicator's spin waits yield the CPU every 64
+iterations: a thread spinning on a core holds off the per-CPU kernel worker that
+finishes the USB4 driver's ring completions for a scheduler slice, which showed
+up as exchange tails of about 3 ms once direct placement removed the round trip
+before each send.
+
 **Prefill overlap.** A prefill step of up to 8,448 tokens runs as two trunk
 batches a layer apart (one batch under 384 tokens), so each batch's exchange
 crosses the link while the other computes; the results equal two steps of
@@ -246,8 +317,9 @@ ownership transitions are not yet mirrored by the control protocol. In-pass
 checkpoints remain disabled in the TP wrapper. Deferred MoE residual fusion
 stays on the single-host path, where it cannot bypass a required rank sum.
 
-The experimental DMA-BUF transport and configurable CQ spin budget are saved
-separately on `codex/wip-tp2-transport-experiments`; neither is part of this merge.
+The configurable CQ spin budget is saved separately on
+`codex/wip-tp2-transport-experiments` and is not part of this merge; the DMA-BUF
+device windows are ([Design](#design)).
 
 ## Tests and probes
 

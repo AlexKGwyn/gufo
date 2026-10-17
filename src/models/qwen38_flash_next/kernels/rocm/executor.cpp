@@ -3721,7 +3721,14 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
                                error_msg, false, checkpoint, batch.emb_row)) {
     return false;
   }
-  if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg)) {
+  // The rank's stacked SSM projections share the F16 mix, just as in the
+  // single-host path. Neither consumes its F32 or tiled Q8 copies.
+  const bool half_only =
+      prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
+      DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
+      l.ssm_alpha_beta.cols == l.ssm_in.cols;
+  if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
+             half_only)) {
     return false;
   }
   if (l.linear) {
